@@ -27,9 +27,11 @@ import (
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
 	modconfig "github.com/foxcpp/maddy/framework/config/module"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/authz"
 	"github.com/foxcpp/maddy/internal/table"
 	"github.com/foxcpp/maddy/internal/target"
@@ -39,7 +41,7 @@ const modName = "check.authorize_sender"
 
 type Check struct {
 	instName string
-	log      log.Logger
+	log      *log.Logger
 
 	checkHeader  bool
 	emailPrepare module.Table
@@ -49,13 +51,14 @@ type Check struct {
 	noMatchAction modconfig.FailAction
 	errAction     modconfig.FailAction
 
-	fromNorm func(string) (string, error)
-	authNorm func(string) (string, error)
+	fromNorm authz.NormalizeFunc
+	authNorm authz.NormalizeFunc
 }
 
-func New(_, instName string, _, inlineArgs []string) (module.Module, error) {
+func New(c *container.C, modName, instName string) (module.Module, error) {
 	return &Check{
 		instName: instName,
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
@@ -67,7 +70,11 @@ func (c *Check) InstanceName() string {
 	return c.instName
 }
 
-func (c *Check) Init(cfg *config.Map) error {
+func (c *Check) Configure(inlineArgs []string, cfg *config.Map) error {
+	if len(inlineArgs) != 0 {
+		return fmt.Errorf("%s: inline arguments are not used", modName)
+	}
+
 	cfg.Bool("debug", true, false, &c.log.Debug)
 
 	cfg.Bool("check_header", false, true, &c.checkHeader)
@@ -89,27 +96,13 @@ func (c *Check) Init(cfg *config.Map) error {
 		return modconfig.FailAction{Reject: true}, nil
 	}, modconfig.FailActionDirective, &c.errAction)
 
-	var (
-		authNormalize string
-		fromNormalize string
-		ok            bool
-	)
-	cfg.String("auth_normalize", false, false,
-		"precis_casefold_email", &authNormalize)
-	cfg.String("from_normalize", false, false,
-		"precis_casefold_email", &fromNormalize)
+	config.EnumMapped(cfg, "auth_normalize", true, false, authz.NormalizeFuncs, authz.NormalizeAuto,
+		&c.authNorm)
+	config.EnumMapped(cfg, "from_normalize", true, false, authz.NormalizeFuncs, authz.NormalizeAuto,
+		&c.fromNorm)
 
 	if _, err := cfg.Process(); err != nil {
 		return err
-	}
-
-	c.authNorm, ok = authz.NormalizeFuncs[authNormalize]
-	if !ok {
-		return fmt.Errorf("%v: unknown normalization function: %v", modName, authNormalize)
-	}
-	c.fromNorm, ok = authz.NormalizeFuncs[fromNormalize]
-	if !ok {
-		return fmt.Errorf("%v: unknown normalization function: %v", modName, fromNormalize)
 	}
 
 	return nil
@@ -118,7 +111,7 @@ func (c *Check) Init(cfg *config.Map) error {
 type state struct {
 	c       *Check
 	msgMeta *module.MsgMetadata
-	log     log.Logger
+	log     *log.Logger
 }
 
 func (c *Check) CheckStateForMsg(_ context.Context, msgMeta *module.MsgMetadata) (module.CheckState, error) {
@@ -162,9 +155,18 @@ func (s *state) authzSender(ctx context.Context, authName, email string) module.
 			}})
 	}
 
+	var preparedEmail []string
+	var ok bool
 	s.log.DebugMsg("normalized names", "from", fromEmailNorm, "auth", authNameNorm)
-
-	preparedEmail, ok, err := s.c.emailPrepare.Lookup(ctx, fromEmailNorm)
+	if emailPrepareMulti, isMulti := s.c.emailPrepare.(module.MultiTable); isMulti {
+		preparedEmail, err = emailPrepareMulti.LookupMulti(ctx, fromEmailNorm)
+		ok = len(preparedEmail) > 0
+	} else {
+		var preparedEmail_single string
+		preparedEmail_single, ok, err = s.c.emailPrepare.Lookup(ctx, fromEmailNorm)
+		preparedEmail = []string{preparedEmail_single}
+	}
+	s.log.DebugMsg("authorized emails", "preparedEmail", preparedEmail, "ok", ok)
 	if err != nil {
 		return s.c.errAction.Apply(module.CheckResult{
 			Reason: &exterrors.SMTPError{
@@ -176,7 +178,7 @@ func (s *state) authzSender(ctx context.Context, authName, email string) module.
 			}})
 	}
 	if !ok {
-		preparedEmail = fromEmailNorm
+		preparedEmail = []string{fromEmailNorm}
 	}
 
 	ok, err = authz.AuthorizeEmailUse(ctx, authNameNorm, preparedEmail, s.c.userToEmail)
@@ -307,5 +309,5 @@ func (s *state) Close() error {
 }
 
 func init() {
-	module.Register(modName, New)
+	modules.Register(modName, New)
 }

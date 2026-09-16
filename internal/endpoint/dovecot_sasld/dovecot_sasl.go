@@ -28,30 +28,36 @@ import (
 	"github.com/emersion/go-sasl"
 	dovecotsasl "github.com/foxcpp/go-dovecot-sasl"
 	"github.com/foxcpp/maddy/framework/config"
+	modconfig "github.com/foxcpp/maddy/framework/config/module"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
-	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
+	"github.com/foxcpp/maddy/framework/resource/netresource"
 	"github.com/foxcpp/maddy/internal/auth"
+	"github.com/foxcpp/maddy/internal/authz"
 )
 
 const modName = "dovecot_sasld"
 
 type Endpoint struct {
 	addrs    []string
-	log      log.Logger
+	log      *log.Logger
 	saslAuth auth.SASLAuth
 
+	endpoints   []config.Endpoint
 	listenersWg sync.WaitGroup
 
 	srv *dovecotsasl.Server
 }
 
-func New(_ string, addrs []string) (module.Module, error) {
+func New(c *container.C, _ string, addrs []string) (container.LifetimeModule, error) {
+	logger := c.DefaultLogger.Sublogger(modName)
 	return &Endpoint{
 		addrs: addrs,
 		saslAuth: auth.SASLAuth{
-			Log: log.Logger{Name: modName + "/saslauth"},
+			Log: logger.Sublogger("sasl"),
 		},
-		log: log.Logger{Name: modName, Debug: log.DefaultLogger.Debug},
+		log: logger,
 	}, nil
 }
 
@@ -63,26 +69,30 @@ func (endp *Endpoint) InstanceName() string {
 	return modName
 }
 
-func (endp *Endpoint) Init(cfg *config.Map) error {
+func (endp *Endpoint) Configure(_ []string, cfg *config.Map) error {
 	cfg.Callback("auth", func(m *config.Map, node config.Node) error {
 		return endp.saslAuth.AddProvider(m, node)
 	})
+	cfg.Bool("sasl_login", false, false, &endp.saslAuth.EnableLogin)
+	config.EnumMapped(cfg, "auth_map_normalize", true, false, authz.NormalizeFuncs, authz.NormalizeAuto,
+		&endp.saslAuth.AuthNormalize)
+	modconfig.Table(cfg, "auth_map", true, false, nil, &endp.saslAuth.AuthMap)
 	if _, err := cfg.Process(); err != nil {
 		return err
 	}
 
 	endp.srv = dovecotsasl.NewServer()
+	endp.saslAuth.Log.Debug = endp.log.Debug
 	endp.srv.Log = stdlog.New(endp.log, "", 0)
 
 	for _, mech := range endp.saslAuth.SASLMechanisms() {
-		mech := mech
 		endp.srv.AddMechanism(mech, mechInfo[mech], func(req *dovecotsasl.AuthReq) sasl.Server {
 			var remoteAddr net.Addr
 			if req.RemoteIP != nil && req.RemotePort != 0 {
 				remoteAddr = &net.TCPAddr{IP: req.RemoteIP, Port: int(req.RemotePort)}
 			}
 
-			return endp.saslAuth.CreateSASL(mech, remoteAddr, func(_ string) error { return nil })
+			return endp.saslAuth.CreateSASL(mech, remoteAddr, func(_ string, _ auth.ContextData) error { return nil })
 		})
 	}
 
@@ -92,12 +102,20 @@ func (endp *Endpoint) Init(cfg *config.Map) error {
 			return fmt.Errorf("%s: %v", modName, err)
 		}
 
-		l, err := net.Listen(parsed.Network(), parsed.Address())
+		endp.endpoints = append(endp.endpoints, parsed)
+	}
+
+	return nil
+}
+
+func (endp *Endpoint) Start() error {
+	for _, addr := range endp.endpoints {
+		l, err := netresource.Listen(addr.Network(), addr.Address())
 		if err != nil {
 			return fmt.Errorf("%s: %v", modName, err)
 		}
-		endp.log.Printf("listening on %v", l.Addr())
 
+		endp.log.Printf("listening on %v", l.Addr())
 		endp.listenersWg.Add(1)
 		go func() {
 			defer endp.listenersWg.Done()
@@ -108,14 +126,14 @@ func (endp *Endpoint) Init(cfg *config.Map) error {
 			}
 		}()
 	}
-
 	return nil
 }
 
-func (endp *Endpoint) Close() error {
+func (endp *Endpoint) Stop() error {
+	defer endp.listenersWg.Wait()
 	return endp.srv.Close()
 }
 
 func init() {
-	module.RegisterEndpoint(modName, New)
+	modules.RegisterEndpoint(modName, New)
 }

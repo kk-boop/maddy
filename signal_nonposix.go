@@ -1,4 +1,5 @@
-//+build windows plan9
+//go:build windows || plan9
+// +build windows plan9
 
 /*
 Maddy Mail Server - Composable all-in-one email server.
@@ -39,6 +40,6 @@ func handleSignals() os.Signal {
 		os.Exit(1)
 	}()
 
-	log.Printf("signal received (%v), next signal will force immediate shutdown.", s)
+	log.Printf("signal received (%v)", s)
 	return s
 }

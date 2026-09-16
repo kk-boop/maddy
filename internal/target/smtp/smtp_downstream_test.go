@@ -25,23 +25,27 @@ import (
 	"os"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/maddy/framework/config"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/internal/testutils"
+	"github.com/stretchr/testify/require"
 )
 
 var testPort string
 
 func TestDownstreamDelivery(t *testing.T) {
 	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+testPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	tarpit := testutils.FailOnConn(t, "127.0.0.2:"+testPort)
-	defer tarpit.Close()
+	defer func() {
+		require.NoError(t, tarpit.Close())
+	}()
 
 	mod := &Downstream{
 		hostname: "mx.example.invalid",
@@ -75,7 +79,9 @@ func TestDownstreamDelivery_LMTP(t *testing.T) {
 			Message: "nop",
 		},
 	}
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	mod := &Downstream{
@@ -126,7 +132,9 @@ func TestDownstreamDelivery_LMTP_ErrorCoerce(t *testing.T) {
 			Message: "nop",
 		},
 	}
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	mod := &Downstream{
@@ -157,7 +165,9 @@ func (sc *statusCollector) SetStatus(rcptTo string, err error) {
 
 func TestDownstreamDelivery_Fallback(t *testing.T) {
 	be, srv := testutils.SMTPServer(t, "127.0.0.2:"+testPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	mod := &Downstream{
@@ -183,7 +193,9 @@ func TestDownstreamDelivery_Fallback(t *testing.T) {
 
 func TestDownstreamDelivery_MAILErr(t *testing.T) {
 	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+testPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	be.MailErr = &smtp.SMTPError{
@@ -208,9 +220,11 @@ func TestDownstreamDelivery_MAILErr(t *testing.T) {
 	testutils.CheckSMTPErr(t, err, 550, exterrors.EnhancedCode{5, 1, 2}, "Hey")
 }
 
-func TestDownstreamDelivery_AttemptTLS(t *testing.T) {
+func TestDownstreamDelivery_StartTLS(t *testing.T) {
 	clientCfg, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+testPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	mod := &Downstream{
@@ -222,97 +236,25 @@ func TestDownstreamDelivery_AttemptTLS(t *testing.T) {
 				Port:   testPort,
 			},
 		},
-		tlsConfig:       *clientCfg.Clone(),
-		attemptStartTLS: true,
-		log:             testutils.Logger(t, "target.smtp"),
+		tlsConfig: clientCfg.Clone(),
+		starttls:  true,
+		log:       testutils.Logger(t, "target.smtp"),
 	}
 
 	testutils.DoTestDelivery(t, mod, "test@example.invalid", []string{"rcpt@example.invalid"})
 	be.CheckMsg(t, 0, "test@example.invalid", []string{"rcpt@example.invalid"})
-	if !be.Messages[0].State.TLS.HandshakeComplete {
-		t.Error("Expected TLS to be used, but it was not")
+
+	tlsState, ok := be.Messages[0].Conn.TLSConnectionState()
+	if !ok || !tlsState.HandshakeComplete {
+		t.Fatal("Message was not delivered over TLS")
 	}
 }
 
-func TestDownstreamDelivery_AttemptTLS_Fallback(t *testing.T) {
-	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+testPort)
-	defer srv.Close()
-	defer testutils.CheckSMTPConnLeak(t, srv)
-
-	mod := &Downstream{
-		hostname: "mx.example.invalid",
-		endpoints: []config.Endpoint{
-			{
-				Scheme: "tcp",
-				Host:   "127.0.0.1",
-				Port:   testPort,
-			},
-		},
-		attemptStartTLS: true,
-		log:             testutils.Logger(t, "target.smtp"),
-	}
-
-	testutils.DoTestDelivery(t, mod, "test@example.invalid", []string{"rcpt@example.invalid"})
-	be.CheckMsg(t, 0, "test@example.invalid", []string{"rcpt@example.invalid"})
-}
-
-func TestDownstreamDelivery_RequireTLS(t *testing.T) {
-	clientCfg, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+testPort)
-	defer srv.Close()
-	defer testutils.CheckSMTPConnLeak(t, srv)
-
-	mod := &Downstream{
-		hostname: "mx.example.invalid",
-		endpoints: []config.Endpoint{
-			{
-				Scheme: "tcp",
-				Host:   "127.0.0.1",
-				Port:   testPort,
-			},
-		},
-		tlsConfig:       *clientCfg.Clone(),
-		attemptStartTLS: true,
-		requireTLS:      true,
-		log:             testutils.Logger(t, "target.smtp"),
-	}
-
-	testutils.DoTestDelivery(t, mod, "test@example.invalid", []string{"rcpt@example.invalid"})
-	be.CheckMsg(t, 0, "test@example.invalid", []string{"rcpt@example.invalid"})
-	if !be.Messages[0].State.TLS.HandshakeComplete {
-		t.Error("Expected TLS to be used, but it was not")
-	}
-}
-
-func TestDownstreamDelivery_RequireTLS_Implicit(t *testing.T) {
-	clientCfg, be, srv := testutils.SMTPServerTLS(t, "127.0.0.1:"+testPort)
-	defer srv.Close()
-	defer testutils.CheckSMTPConnLeak(t, srv)
-
-	mod := &Downstream{
-		hostname: "mx.example.invalid",
-		endpoints: []config.Endpoint{
-			{
-				Scheme: "tls",
-				Host:   "127.0.0.1",
-				Port:   testPort,
-			},
-		},
-		tlsConfig:       *clientCfg.Clone(),
-		attemptStartTLS: true,
-		requireTLS:      true,
-		log:             testutils.Logger(t, "target.smtp"),
-	}
-
-	testutils.DoTestDelivery(t, mod, "test@example.invalid", []string{"rcpt@example.invalid"})
-	be.CheckMsg(t, 0, "test@example.invalid", []string{"rcpt@example.invalid"})
-	if !be.Messages[0].State.TLS.HandshakeComplete {
-		t.Error("Expected TLS to be used, but it was not")
-	}
-}
-
-func TestDownstreamDelivery_RequireTLS_Fail(t *testing.T) {
+func TestDownstreamDelivery_StartTLS_NoFallback(t *testing.T) {
 	_, srv := testutils.SMTPServer(t, "127.0.0.1:"+testPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	mod := &Downstream{
@@ -324,9 +266,8 @@ func TestDownstreamDelivery_RequireTLS_Fail(t *testing.T) {
 				Port:   testPort,
 			},
 		},
-		attemptStartTLS: true,
-		requireTLS:      true,
-		log:             testutils.Logger(t, "target.smtp"),
+		starttls: true,
+		log:      testutils.Logger(t, "target.smtp"),
 	}
 
 	_, err := testutils.DoTestDeliveryErr(t, mod, "test@example.invalid", []string{"rcpt@example.invalid"})
@@ -340,7 +281,6 @@ func TestMain(m *testing.M) {
 	flag.Parse()
 
 	if *remoteSmtpPort == "random" {
-		rand.Seed(time.Now().UnixNano())
 		*remoteSmtpPort = strconv.Itoa(rand.Intn(65536-10000) + 10000)
 	}
 

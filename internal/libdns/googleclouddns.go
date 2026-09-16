@@ -1,15 +1,18 @@
-//+build libdns_googleclouddns libdns_all
+//go:build libdns_googleclouddns || libdns_all
+// +build libdns_googleclouddns libdns_all
 
 package libdns
 
 import (
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/libdns/googleclouddns"
 )
 
 func init() {
-	module.Register("libdns.googleclouddns", func(modName, instName string, _, _ []string) (module.Module, error) {
+	modules.Register("libdns.googleclouddns", func(c *container.C, modName, instName string) (module.Module, error) {
 		p := googleclouddns.Provider{}
 		return &ProviderModule{
 			RecordDeleter:  &p,

@@ -22,7 +22,6 @@ package log
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"strings"
 	"time"
@@ -43,6 +42,8 @@ import (
 // No serialization is provided by Logger, its log.Output responsibility to
 // ensure goroutine-safety if necessary.
 type Logger struct {
+	Parent *Logger
+
 	Out   Output
 	Name  string
 	Debug bool
@@ -52,48 +53,53 @@ type Logger struct {
 	Fields map[string]interface{}
 }
 
-func (l Logger) Zap() *zap.Logger {
+func (l *Logger) Zap() *zap.Logger {
 	// TODO: Migrate to using zap natively.
 	return zap.New(zapLogger{L: l})
 }
 
-func (l Logger) Debugf(format string, val ...interface{}) {
-	if !l.Debug {
+func (l *Logger) IsDebug() bool {
+	return l.Debug || (l.Parent != nil && l.Parent.IsDebug())
+}
+
+func (l *Logger) Debugf(format string, val ...interface{}) {
+	if !l.IsDebug() {
 		return
 	}
 	l.log(true, l.formatMsg(fmt.Sprintf(format, val...), nil))
 }
 
-func (l Logger) Debugln(val ...interface{}) {
-	if !l.Debug {
+func (l *Logger) Debugln(val ...interface{}) {
+	if !l.IsDebug() {
 		return
 	}
 	l.log(true, l.formatMsg(strings.TrimRight(fmt.Sprintln(val...), "\n"), nil))
 }
 
-func (l Logger) Printf(format string, val ...interface{}) {
+func (l *Logger) Printf(format string, val ...interface{}) {
 	l.log(false, l.formatMsg(fmt.Sprintf(format, val...), nil))
 }
 
-func (l Logger) Println(val ...interface{}) {
+func (l *Logger) Println(val ...interface{}) {
 	l.log(false, l.formatMsg(strings.TrimRight(fmt.Sprintln(val...), "\n"), nil))
 }
 
 // Msg writes an event log message in a machine-readable format (currently
 // JSON).
-//   name: msg\t{"key":"value","key2":"value2"}
+//
+//	name: msg\t{"key":"value","key2":"value2"}
 //
 // Key-value pairs are built from fields slice which should contain key strings
 // followed by corresponding values.  That is, for example, []interface{"key",
 // "value", "key2", "value2"}.
 //
-// If value in fields implements LogFormatter, it will be represented by the
+// If value in fields implements Formatter, it will be represented by the
 // string returned by FormatLog method. Same goes for fmt.Stringer and error
 // interfaces.
 //
 // Additionally, time.Time is written as a string in ISO 8601 format.
 // time.Duration follows fmt.Stringer rule above.
-func (l Logger) Msg(msg string, fields ...interface{}) {
+func (l *Logger) Msg(msg string, fields ...interface{}) {
 	m := make(map[string]interface{}, len(fields)/2)
 	fieldsToMap(fields, m)
 	l.log(false, l.formatMsg(msg, m))
@@ -103,14 +109,16 @@ func (l Logger) Msg(msg string, fields ...interface{}) {
 // JSON) containing information about the error. If err does have a Fields
 // method that returns map[string]interface{}, its result will be added to the
 // message.
-//   name: msg\t{"key":"value","key2":"value2"}
+//
+//	name: msg\t{"key":"value","key2":"value2"}
+//
 // Additionally, values from fields will be added to it, as handled by
 // Logger.Msg.
 //
 // In the context of Error method, "msg" typically indicates the top-level
 // context in which the error is *handled*. For example, if error leads to
 // rejection of SMTP DATA command, msg will probably be "DATA error".
-func (l Logger) Error(msg string, err error, fields ...interface{}) {
+func (l *Logger) Error(msg string, err error, fields ...interface{}) {
 	if err == nil {
 		return
 	}
@@ -131,8 +139,8 @@ func (l Logger) Error(msg string, err error, fields ...interface{}) {
 	l.log(false, l.formatMsg(msg, allFields))
 }
 
-func (l Logger) DebugMsg(kind string, fields ...interface{}) {
-	if !l.Debug {
+func (l *Logger) DebugMsg(kind string, fields ...interface{}) {
+	if !l.IsDebug() {
 		return
 	}
 	m := make(map[string]interface{}, len(fields)/2)
@@ -160,7 +168,7 @@ func fieldsToMap(fields []interface{}, out map[string]interface{}) {
 	}
 }
 
-func (l Logger) formatMsg(msg string, fields map[string]interface{}) string {
+func (l *Logger) formatMsg(msg string, fields map[string]interface{}) string {
 	formatted := strings.Builder{}
 
 	formatted.WriteString(msg)
@@ -182,44 +190,90 @@ func (l Logger) formatMsg(msg string, fields map[string]interface{}) string {
 	return formatted.String()
 }
 
-type LogFormatter interface {
+type Formatter interface {
 	FormatLog() string
 }
 
 // Write implements io.Writer, all bytes sent
 // to it will be written as a separate log messages.
 // No line-buffering is done.
-func (l Logger) Write(s []byte) (int, error) {
+func (l *Logger) Write(s []byte) (int, error) {
+	if !l.IsDebug() {
+		return len(s), nil
+	}
 	l.log(false, strings.TrimRight(string(s), "\n"))
 	return len(s), nil
+}
+
+// Close closes underlying output in Out.
+func (l *Logger) Close() error {
+	if l.Out == nil {
+		return nil
+	}
+
+	return l.Out.Close()
 }
 
 // DebugWriter returns a writer that will act like Logger.Write
 // but will use debug flag on messages. If Logger.Debug is false,
 // Write method of returned object will be no-op.
-func (l Logger) DebugWriter() io.Writer {
-	if !l.Debug {
-		return ioutil.Discard
-	}
-	l.Debug = true
-	return &l
+func (l *Logger) DebugWriter() io.Writer {
+	l2 := l.Sublogger("")
+	l2.Debug = true
+	return l2
 }
 
-func (l Logger) log(debug bool, s string) {
+func (l *Logger) output() Output {
+	if l.Out != nil {
+		return l.Out
+	}
+	if l.Parent != nil {
+		return l.Parent.output()
+	}
+
+	if DefaultLogger.Out == nil {
+		panic("DefaultLogger.Out is not set")
+	}
+	if l.Parent == nil && l != &DefaultLogger {
+		DefaultLogger.Out.Write(time.Now(), true, "logger "+l.Name+" has no parent, this is a bug")
+	}
+	return DefaultLogger.Out
+}
+
+func (l *Logger) log(debug bool, s string) {
 	if l.Name != "" {
 		s = l.Name + ": " + s
 	}
 
-	if l.Out != nil {
-		l.Out.Write(time.Now(), debug, s)
-		return
-	}
-	if DefaultLogger.Out != nil {
-		DefaultLogger.Out.Write(time.Now(), debug, s)
-		return
-	}
+	out := l.output()
+	out.Write(time.Now(), debug, s)
 
 	// Logging is disabled - do nothing.
+}
+
+func (l *Logger) logNameOverwrite(loggerName string, debug bool, s string) {
+	if loggerName == "" {
+		loggerName = l.Name
+	}
+	if loggerName != "" {
+		s = loggerName + ": " + s
+	}
+
+	out := l.output()
+	out.Write(time.Now(), debug, s)
+
+	// Logging is disabled - do nothing.
+}
+
+
+func (l *Logger) Sublogger(name string) *Logger {
+	if l.Name != "" && name != "" {
+		name = l.Name + "/" + name
+	}
+	return &Logger{
+		Parent: l,
+		Name:   name,
+	}
 }
 
 // DefaultLogger is the global Logger object that is used by
@@ -228,6 +282,12 @@ func (l Logger) log(debug bool, s string) {
 // As with all other Loggers, it is not gorountine-safe on its own,
 // however underlying log.Output may provide necessary serialization.
 var DefaultLogger = Logger{Out: WriterOutput(os.Stderr, false)}
+
+// NopLogger is the logger that discards all messages written to it.
+var NopLogger = Logger{
+	Parent: &DefaultLogger,
+	Out:    NopOutput{},
+}
 
 func Debugf(format string, val ...interface{}) { DefaultLogger.Debugf(format, val...) }
 func Debugln(val ...interface{})               { DefaultLogger.Debugln(val...) }

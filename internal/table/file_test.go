@@ -19,26 +19,38 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package table
 
 import (
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/internal/testutils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestReadFile(t *testing.T) {
 	test := func(file string, expected map[string][]string) {
 		t.Helper()
 
-		f, err := ioutil.TempFile("", "maddy-tests-")
+		f, err := os.CreateTemp("", "maddy-tests-")
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer os.Remove(f.Name())
-		defer f.Close()
+		defer func(name string) {
+			err := os.Remove(name)
+			if err != nil {
+				t.Log(err)
+			}
+		}(f.Name())
+		defer func(f *os.File) {
+			err := f.Close()
+			if err != nil {
+				t.Log(err)
+			}
+		}(f)
 		if _, err := f.WriteString(file); err != nil {
 			t.Fatal(err)
 		}
@@ -66,7 +78,8 @@ func TestReadFile(t *testing.T) {
 	test(`"a @ a"@example.org: b@example.com`, map[string][]string{`"a @ a"@example.org`: {"b@example.com"}})
 	test(`a@example.org: "b @ b"@example.com`, map[string][]string{`a@example.org`: {`"b @ b"@example.com`}})
 	test(`"a @ a": "b @ b"`, map[string][]string{`"a @ a"`: {`"b @ b"`}})
-	test("a: b, c", map[string][]string{"a": {"b, c"}})
+	test("a: b, c", map[string][]string{"a": {"b", "c"}})
+	test("a: b\na: c", map[string][]string{"a": {"b", "c"}})
 	test(": b", nil)
 	test(":", nil)
 	test("aaa", map[string][]string{"aaa": {""}})
@@ -87,50 +100,62 @@ func TestFileReload(t *testing.T) {
 
 	const file = `cat: dog`
 
-	f, err := ioutil.TempFile("", "maddy-tests-")
+	f, err := os.CreateTemp("", "maddy-tests-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(f.Name())
+	defer func(name string) {
+		err := os.Remove(name)
+		if err != nil {
+			t.Log(err)
+		}
+	}(f.Name())
 	if _, err := f.WriteString(file); err != nil {
-		f.Close()
+		_ = f.Close()
 		t.Fatal(err)
 	}
-	f.Close()
+	err = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	mod, err := NewFile("", "", nil, []string{f.Name()})
+	mod, err := NewFile(container.New(), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := mod.(*File)
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
 	m.log = testutils.Logger(t, "file_map")
-	defer m.Close()
+	defer func() {
+		assert.NoError(t, m.Stop())
+	}()
 
-	if err := mod.Init(&config.Map{Block: config.Node{}}); err != nil {
+	if err := mod.Configure([]string{f.Name()}, &config.Map{Block: config.Node{}}); err != nil {
 		t.Fatal(err)
 	}
 
-	// This delay is somehow important. Not sure why.
-	time.Sleep(250 * time.Millisecond)
-
-	if err := ioutil.WriteFile(f.Name(), []byte("dog: cat"), os.ModePerm); err != nil {
-		t.Fatal(err)
+	// ensure it is correctly loaded at first time.
+	m.mLck.RLock()
+	if m.m["cat"] == nil {
+		t.Fatalf("wrong content loaded, new m were not loaded, %v", m.m)
 	}
+	m.mLck.RUnlock()
 
-	for i := 0; i < 10; i++ {
-		time.Sleep(reloadInterval + 50*time.Millisecond)
+	for i := 0; i < 100; i++ {
+		// try to provoke race condition on file writing
+		if i%2 == 0 {
+			if err := os.WriteFile(f.Name(), []byte("dog: cat"), os.ModePerm); err != nil {
+				t.Fatal(err)
+			}
+		}
+		time.Sleep(reloadInterval + 5*time.Millisecond)
 		m.mLck.RLock()
-		if m.m["dog"] != nil {
-			m.mLck.RUnlock()
-			break
+		if m.m["dog"] == nil {
+			t.Fatalf("wrong content loaded, new m were not loaded, %v", m.m)
 		}
 		m.mLck.RUnlock()
-	}
-
-	m.mLck.RLock()
-	defer m.mLck.RUnlock()
-	if m.m["dog"] == nil {
-		t.Fatal("New m were not loaded")
 	}
 }
 
@@ -139,26 +164,39 @@ func TestFileReload_Broken(t *testing.T) {
 
 	const file = `cat: dog`
 
-	f, err := ioutil.TempFile("", "maddy-tests-")
+	f, err := os.CreateTemp("", "maddy-tests-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(f.Name())
+	defer func(name string) {
+		err := os.Remove(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}(f.Name())
 	if _, err := f.WriteString(file); err != nil {
-		f.Close()
+		require.NoError(t, f.Close())
 		t.Fatal(err)
 	}
-	f.Close()
+	require.NoError(t, f.Close())
 
-	mod, err := NewFile("", "", nil, []string{f.Name()})
+	mod, err := NewFile(container.New(), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := mod.(*File)
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
 	m.log = testutils.Logger(t, FileModName)
-	defer m.Close()
+	defer func(m *File) {
+		err := m.Stop()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}(m)
 
-	if err := mod.Init(&config.Map{Block: config.Node{}}); err != nil {
+	if err := mod.Configure([]string{f.Name()}, &config.Map{Block: config.Node{}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -169,7 +207,12 @@ func TestFileReload_Broken(t *testing.T) {
 	if _, err := f2.WriteString(":"); err != nil {
 		t.Fatal(err)
 	}
-	defer f2.Close()
+	defer func(f2 *os.File) {
+		err := f2.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}(f2)
 
 	time.Sleep(3 * reloadInterval)
 
@@ -185,32 +228,43 @@ func TestFileReload_Removed(t *testing.T) {
 
 	const file = `cat: dog`
 
-	f, err := ioutil.TempFile("", "maddy-tests-")
+	f, err := os.CreateTemp("", "maddy-tests-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.WriteString(file); err != nil {
-		f.Close()
+		_ = f.Close()
 		t.Fatal(err)
 	}
-	f.Close()
+	err = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	mod, err := NewFile("", "", nil, []string{f.Name()})
+	mod, err := NewFile(container.New(), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := mod.(*File)
+	if err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
 	m.log = testutils.Logger(t, FileModName)
-	defer m.Close()
+	defer func(m *File) {
+		err := m.Stop()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}(m)
 
-	if err := mod.Init(&config.Map{Block: config.Node{}}); err != nil {
+	if err := mod.Configure([]string{f.Name()}, &config.Map{Block: config.Node{}}); err != nil {
 		t.Fatal(err)
 	}
 
-	// This delay is somehow important. Not sure why.
-	time.Sleep(250 * time.Millisecond)
-
-	os.Remove(f.Name())
+	err = os.Remove(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	time.Sleep(3 * reloadInterval)
 
@@ -222,5 +276,5 @@ func TestFileReload_Removed(t *testing.T) {
 }
 
 func init() {
-	reloadInterval = 250 * time.Millisecond
+	reloadInterval = 10 * time.Millisecond
 }

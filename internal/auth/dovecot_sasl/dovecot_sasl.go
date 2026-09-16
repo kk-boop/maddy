@@ -25,16 +25,18 @@ import (
 	"github.com/emersion/go-sasl"
 	dovecotsasl "github.com/foxcpp/go-dovecot-sasl"
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/auth"
 )
 
 type Auth struct {
 	instName       string
 	serverEndpoint string
-	log            log.Logger
+	log            *log.Logger
 
 	network string
 	addr    string
@@ -44,18 +46,10 @@ type Auth struct {
 
 const modName = "dovecot_sasl"
 
-func New(_, instName string, _, inlineArgs []string) (module.Module, error) {
+func New(c *container.C, _, instName string) (module.Module, error) {
 	a := &Auth{
 		instName: instName,
-		log:      log.Logger{Name: modName, Debug: log.DefaultLogger.Debug},
-	}
-
-	switch len(inlineArgs) {
-	case 0:
-	case 1:
-		a.serverEndpoint = inlineArgs[0]
-	default:
-		return nil, fmt.Errorf("%s: one or none arguments needed", modName)
+		log:      c.DefaultLogger.Sublogger(modName),
 	}
 
 	return a, nil
@@ -85,10 +79,20 @@ func (a *Auth) getConn() (*dovecotsasl.Client, error) {
 }
 
 func (a *Auth) returnConn(cl *dovecotsasl.Client) {
-	cl.Close()
+	if err := cl.Close(); err != nil {
+		a.log.Error("connection close failed", err)
+	}
 }
 
-func (a *Auth) Init(cfg *config.Map) error {
+func (a *Auth) Configure(inlineArgs []string, cfg *config.Map) error {
+	switch len(inlineArgs) {
+	case 0:
+	case 1:
+		a.serverEndpoint = inlineArgs[0]
+	default:
+		return fmt.Errorf("%s: one or none arguments needed", modName)
+	}
+
 	cfg.String("endpoint", false, false, a.serverEndpoint, &a.serverEndpoint)
 	if _, err := cfg.Process(); err != nil {
 		return err
@@ -113,7 +117,11 @@ func (a *Auth) Init(cfg *config.Map) error {
 		return fmt.Errorf("%s: unable to contact server: %v", modName, err)
 	}
 
-	defer cl.Close()
+	defer func() {
+		if err := cl.Close(); err != nil {
+			a.log.Error("connection close failed", err)
+		}
+	}()
 	a.mechanisms = make(map[string]dovecotsasl.Mechanism, len(cl.ConnInfo().Mechs))
 	for name, mech := range cl.ConnInfo().Mechs {
 		if mech.Private {
@@ -156,5 +164,5 @@ func (a *Auth) AuthPlain(username, password string) error {
 }
 
 func init() {
-	module.Register(modName, New)
+	modules.Register(modName, New)
 }

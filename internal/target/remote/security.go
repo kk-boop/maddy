@@ -28,11 +28,13 @@ import (
 
 	"github.com/foxcpp/go-mtasts"
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/dns"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/future"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/target"
 )
 
@@ -41,21 +43,21 @@ type (
 		cache       *mtasts.Cache
 		mtastsGet   func(context.Context, string) (*mtasts.Policy, error)
 		updaterStop chan struct{}
-		log         log.Logger
+		log         *log.Logger
 		instName    string
 	}
 	mtastsDelivery struct {
 		c         *mtastsPolicy
 		domain    string
 		policyFut *future.Future
-		log       log.Logger
+		log       *log.Logger
 	}
 )
 
-func NewMTASTSPolicy(_, instName string, _, _ []string) (module.Module, error) {
+func NewMTASTSPolicy(c *container.C, modName, instName string) (module.Module, error) {
 	return &mtastsPolicy{
 		instName: instName,
-		log:      log.Logger{Name: "mx_auth.mtasts", Debug: log.DefaultLogger.Debug},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
@@ -71,7 +73,7 @@ func (c *mtastsPolicy) Weight() int {
 	return 10
 }
 
-func (c *mtastsPolicy) Init(cfg *config.Map) error {
+func (c *mtastsPolicy) Configure(inlineArgs []string, cfg *config.Map) error {
 	var (
 		storeType string
 		storeDir  string
@@ -99,6 +101,11 @@ func (c *mtastsPolicy) Init(cfg *config.Map) error {
 	return nil
 }
 
+func (c *mtastsPolicy) Start() error {
+	c.StartUpdater()
+	return nil
+}
+
 // StartUpdater starts a goroutine to update MTA-STS cache periodically until
 // Close is called.
 //
@@ -106,6 +113,15 @@ func (c *mtastsPolicy) Init(cfg *config.Map) error {
 func (c *mtastsPolicy) StartUpdater() {
 	c.updaterStop = make(chan struct{})
 	go c.updater()
+}
+
+func (c *mtastsPolicy) Stop() error {
+	if c.updaterStop != nil {
+		c.updaterStop <- struct{}{}
+		<-c.updaterStop
+		c.updaterStop = nil
+	}
+	return nil
 }
 
 func (c *mtastsPolicy) updater() {
@@ -142,20 +158,11 @@ func (c *mtastsPolicy) updater() {
 	}
 }
 
-func (c *mtastsPolicy) Start(msgMeta *module.MsgMetadata) module.DeliveryMXAuthPolicy {
+func (c *mtastsPolicy) StartDelivery(msgMeta *module.MsgMetadata) module.DeliveryMXAuthPolicy {
 	return &mtastsDelivery{
 		c:   c,
 		log: target.DeliveryLogger(c.log, msgMeta),
 	}
-}
-
-func (c *mtastsPolicy) Close() error {
-	if c.updaterStop != nil {
-		c.updaterStop <- struct{}{}
-		<-c.updaterStop
-		c.updaterStop = nil
-	}
-	return nil
 }
 
 func (c *mtastsDelivery) PrepareDomain(ctx context.Context, domain string) {
@@ -180,7 +187,7 @@ func (c *mtastsDelivery) CheckMX(ctx context.Context, mxLevel module.MXLevel, do
 			return module.MXNone, &exterrors.SMTPError{
 				Code:         550,
 				EnhancedCode: exterrors.EnhancedCode{5, 7, 0},
-				Message:      "Failed to estabilish the module.MX record authenticity (MTA-STS)",
+				Message:      "Failed to establish the MX record authenticity (MTA-STS)",
 			}
 		}
 		c.log.Msg("MX does not match published non-enforced MTA-STS policy", "mx", mx, "domain", c.domain)
@@ -213,7 +220,7 @@ func (c *mtastsDelivery) CheckConn(ctx context.Context, mxLevel module.MXLevel, 
 		return module.TLSNone, &exterrors.SMTPError{
 			Code:         451,
 			EnhancedCode: exterrors.EnhancedCode{4, 7, 1},
-			Message: "Recipient server module.TLS certificate is not trusted but " +
+			Message: "Recipient server TLS certificate is not trusted but " +
 				"authentication is required by MTA-STS",
 			Misc: map[string]interface{}{
 				"tls_level": tlsLevel,
@@ -233,14 +240,14 @@ func (c *mtastsDelivery) Reset(msgMeta *module.MsgMetadata) {
 
 // Stub that will be removed in 0.5.
 type stsPreloadPolicy struct {
-	log      log.Logger
+	log      *log.Logger
 	instName string
 }
 
-func NewSTSPreload(_, instName string, _, _ []string) (module.Module, error) {
+func NewSTSPreload(c *container.C, modName, instName string) (module.Module, error) {
 	return &stsPreloadPolicy{
 		instName: instName,
-		log:      log.Logger{Name: "mx_auth.sts_preload", Debug: log.DefaultLogger.Debug},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
@@ -256,7 +263,7 @@ func (c *stsPreloadPolicy) Weight() int {
 	return 30 // after MTA-STS
 }
 
-func (c *stsPreloadPolicy) Init(cfg *config.Map) error {
+func (c *stsPreloadPolicy) Configure(inlineArgs []string, cfg *config.Map) error {
 	c.log.Println("sts_preload module is deprecated and is no-op as the list is expired and unmaintained")
 
 	var (
@@ -276,7 +283,7 @@ type preloadDelivery struct {
 	*stsPreloadPolicy
 }
 
-func (p *stsPreloadPolicy) Start(*module.MsgMetadata) module.DeliveryMXAuthPolicy {
+func (p *stsPreloadPolicy) StartDelivery(*module.MsgMetadata) module.DeliveryMXAuthPolicy {
 	return &preloadDelivery{stsPreloadPolicy: p}
 }
 
@@ -291,43 +298,35 @@ func (p *preloadDelivery) CheckConn(ctx context.Context, mxLevel module.MXLevel,
 	return tlsLevel, nil
 }
 
-func (p *stsPreloadPolicy) Close() error {
-	return nil
-}
-
 type dnssecPolicy struct {
 	instName string
 }
 
-func NewDNSSECPolicy(_, instName string, _, _ []string) (module.Module, error) {
+func NewDNSSECPolicy(_ *container.C, _, instName string) (module.Module, error) {
 	return &dnssecPolicy{
 		instName: instName,
 	}, nil
 }
 
-func (c *dnssecPolicy) Name() string {
+func (dnssecPolicy) Name() string {
 	return "mx_auth.dnssec"
 }
 
-func (c *dnssecPolicy) InstanceName() string {
+func (c dnssecPolicy) InstanceName() string {
 	return c.instName
 }
 
-func (c *dnssecPolicy) Weight() int {
+func (dnssecPolicy) Weight() int {
 	return 1
 }
 
-func (c *dnssecPolicy) Init(cfg *config.Map) error {
+func (dnssecPolicy) Configure(inlineArgs []string, cfg *config.Map) error {
 	_, err := cfg.Process() // will fail if there is any directive
 	return err
 }
 
-func (dnssecPolicy) Start(*module.MsgMetadata) module.DeliveryMXAuthPolicy {
+func (dnssecPolicy) StartDelivery(*module.MsgMetadata) module.DeliveryMXAuthPolicy {
 	return dnssecPolicy{}
-}
-
-func (dnssecPolicy) Close() error {
-	return nil
 }
 
 func (dnssecPolicy) Reset(*module.MsgMetadata)                        {}
@@ -348,7 +347,7 @@ func (dnssecPolicy) CheckConn(ctx context.Context, mxLevel module.MXLevel, tlsLe
 type (
 	danePolicy struct {
 		extResolver *dns.ExtResolver
-		log         log.Logger
+		log         *log.Logger
 		instName    string
 	}
 	daneDelivery struct {
@@ -357,10 +356,10 @@ type (
 	}
 )
 
-func NewDANEPolicy(_, instName string, _, _ []string) (module.Module, error) {
+func NewDANEPolicy(c *container.C, modName, instName string) (module.Module, error) {
 	return &danePolicy{
 		instName: instName,
-		log:      log.Logger{Name: "remote/dane", Debug: log.DefaultLogger.Debug},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
@@ -376,7 +375,7 @@ func (c *danePolicy) Weight() int {
 	return 10
 }
 
-func (c *danePolicy) Init(cfg *config.Map) error {
+func (c *danePolicy) Configure(inlineArgs []string, cfg *config.Map) error {
 	var err error
 	c.extResolver, err = dns.NewExtResolver()
 	if err != nil {
@@ -389,12 +388,8 @@ func (c *danePolicy) Init(cfg *config.Map) error {
 	return err
 }
 
-func (c *danePolicy) Start(*module.MsgMetadata) module.DeliveryMXAuthPolicy {
+func (c *danePolicy) StartDelivery(*module.MsgMetadata) module.DeliveryMXAuthPolicy {
 	return &daneDelivery{c: c}
-}
-
-func (c *danePolicy) Close() error {
-	return nil
 }
 
 func (c *daneDelivery) PrepareDomain(ctx context.Context, domain string) {}
@@ -536,7 +531,7 @@ type (
 	}
 )
 
-func NewLocalPolicy(_, instName string, _, _ []string) (module.Module, error) {
+func NewLocalPolicy(_ *container.C, _, instName string) (module.Module, error) {
 	return &localPolicy{
 		instName: instName,
 	}, nil
@@ -554,7 +549,7 @@ func (c *localPolicy) Weight() int {
 	return 1000
 }
 
-func (c *localPolicy) Init(cfg *config.Map) error {
+func (c *localPolicy) Configure(inlineArgs []string, cfg *config.Map) error {
 	var (
 		minTLSLevel string
 		minMXLevel  string
@@ -589,42 +584,40 @@ func (c *localPolicy) Init(cfg *config.Map) error {
 	return nil
 }
 
-func (l localPolicy) Start(msgMeta *module.MsgMetadata) module.DeliveryMXAuthPolicy {
+func (l *localPolicy) StartDelivery(msgMeta *module.MsgMetadata) module.DeliveryMXAuthPolicy {
 	return l
 }
 
-func (l localPolicy) Close() error {
-	return nil
-}
+func (l *localPolicy) Reset(*module.MsgMetadata)                        {}
+func (l *localPolicy) PrepareDomain(ctx context.Context, domain string) {}
+func (l *localPolicy) PrepareConn(ctx context.Context, mx string)       {}
 
-func (l localPolicy) Reset(*module.MsgMetadata)                        {}
-func (l localPolicy) PrepareDomain(ctx context.Context, domain string) {}
-func (l localPolicy) PrepareConn(ctx context.Context, mx string)       {}
-
-func (l localPolicy) CheckMX(ctx context.Context, mxLevel module.MXLevel, domain, mx string, dnssec bool) (module.MXLevel, error) {
+func (l *localPolicy) CheckMX(ctx context.Context, mxLevel module.MXLevel, domain, mx string, dnssec bool) (module.MXLevel, error) {
 	if mxLevel < l.minMXLevel {
 		return module.MXNone, &exterrors.SMTPError{
 			// Err on the side of caution if policy evaluation was messed up by
 			// a temporary error (we can't know with the current design).
 			Code:         451,
 			EnhancedCode: exterrors.EnhancedCode{4, 7, 0},
-			Message:      "Failed to estabilish the module.MX record authenticity",
+			Message:      "Failed to establish the MX record authenticity",
 			Misc: map[string]interface{}{
-				"mx_level": mxLevel,
+				"mx_level":          mxLevel,
+				"required_mx_level": l.minMXLevel,
 			},
 		}
 	}
 	return module.MXNone, nil
 }
 
-func (l localPolicy) CheckConn(ctx context.Context, mxLevel module.MXLevel, tlsLevel module.TLSLevel, domain, mx string, tlsState tls.ConnectionState) (module.TLSLevel, error) {
+func (l *localPolicy) CheckConn(ctx context.Context, mxLevel module.MXLevel, tlsLevel module.TLSLevel, domain, mx string, tlsState tls.ConnectionState) (module.TLSLevel, error) {
 	if tlsLevel < l.minTLSLevel {
 		return module.TLSNone, &exterrors.SMTPError{
 			Code:         451,
 			EnhancedCode: exterrors.EnhancedCode{4, 7, 1},
 			Message:      "TLS it not available or unauthenticated but required",
 			Misc: map[string]interface{}{
-				"tls_level": tlsLevel,
+				"tls_level":          tlsLevel,
+				"required_tls_level": l.minTLSLevel,
 			},
 		}
 	}
@@ -632,9 +625,9 @@ func (l localPolicy) CheckConn(ctx context.Context, mxLevel module.MXLevel, tlsL
 }
 
 func init() {
-	module.Register("mx_auth.mtasts", NewMTASTSPolicy)
-	module.Register("mx_auth.sts_preload", NewSTSPreload)
-	module.Register("mx_auth.dnssec", NewDNSSECPolicy)
-	module.Register("mx_auth.dane", NewDANEPolicy)
-	module.Register("mx_auth.local_policy", NewLocalPolicy)
+	modules.Register("mx_auth.mtasts", NewMTASTSPolicy)
+	modules.Register("mx_auth.sts_preload", NewSTSPreload)
+	modules.Register("mx_auth.dnssec", NewDNSSECPolicy)
+	modules.Register("mx_auth.dane", NewDANEPolicy)
+	modules.Register("mx_auth.local_policy", NewLocalPolicy)
 }

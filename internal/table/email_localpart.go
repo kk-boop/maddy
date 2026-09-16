@@ -23,22 +23,26 @@ import (
 
 	"github.com/foxcpp/maddy/framework/address"
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 type EmailLocalpart struct {
-	modName  string
-	instName string
+	modName       string
+	instName      string
+	allowNonEmail bool
 }
 
-func NewEmailLocalpart(modName, instName string, _, _ []string) (module.Module, error) {
+func NewEmailLocalpart(_ *container.C, modName, instName string) (module.Module, error) {
 	return &EmailLocalpart{
-		modName:  modName,
-		instName: instName,
+		modName:       modName,
+		instName:      instName,
+		allowNonEmail: modName == "table.email_localpart_optional",
 	}, nil
 }
 
-func (s *EmailLocalpart) Init(cfg *config.Map) error {
+func (s *EmailLocalpart) Configure(inlineArgs []string, cfg *config.Map) error {
 	return nil
 }
 
@@ -53,6 +57,9 @@ func (s *EmailLocalpart) InstanceName() string {
 func (s *EmailLocalpart) Lookup(ctx context.Context, key string) (string, bool, error) {
 	mbox, _, err := address.Split(key)
 	if err != nil {
+		if s.allowNonEmail {
+			return key, true, nil
+		}
 		// Invalid email, no local part mapping.
 		return "", false, nil
 	}
@@ -60,5 +67,6 @@ func (s *EmailLocalpart) Lookup(ctx context.Context, key string) (string, bool, 
 }
 
 func init() {
-	module.Register("table.email_localpart", NewEmailLocalpart)
+	modules.Register("table.email_localpart", NewEmailLocalpart)
+	modules.Register("table.email_localpart_optional", NewEmailLocalpart)
 }

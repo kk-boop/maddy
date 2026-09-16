@@ -35,15 +35,18 @@ import (
 	"time"
 
 	"github.com/emersion/go-message/textproto"
+	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/maddy/framework/address"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
 	modconfig "github.com/foxcpp/maddy/framework/config/module"
 	tls2 "github.com/foxcpp/maddy/framework/config/tls"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/dns"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/limits"
 	"github.com/foxcpp/maddy/internal/smtpconn/pool"
 	"github.com/foxcpp/maddy/internal/target"
@@ -77,7 +80,7 @@ type Target struct {
 	pool           *pool.P
 	connReuseLimit int
 
-	Log log.Logger
+	log *log.Logger
 
 	connectTimeout    time.Duration
 	commandTimeout    time.Duration
@@ -86,30 +89,31 @@ type Target struct {
 
 var _ module.DeliveryTarget = &Target{}
 
-func New(_, instName string, _, inlineArgs []string) (module.Module, error) {
-	if len(inlineArgs) != 0 {
-		return nil, errors.New("remote: inline arguments are not used")
-	}
+func New(c *container.C, modName, instName string) (module.Module, error) {
 	// Keep this synchronized with testTarget.
 	return &Target{
 		name:     instName,
 		resolver: dns.DefaultResolver(),
 		dialer:   (&net.Dialer{}).DialContext,
-		Log:      log.Logger{Name: "remote"},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
-func (rt *Target) Init(cfg *config.Map) error {
+func (rt *Target) Configure(inlineArgs []string, cfg *config.Map) error {
+	if len(inlineArgs) != 0 {
+		return errors.New("remote: inline arguments are not used")
+	}
+
 	var err error
 	rt.extResolver, err = dns.NewExtResolver()
 	if err != nil {
-		rt.Log.Error("cannot initialize DNSSEC-aware resolver, DNSSEC and DANE are not available", err)
+		rt.log.Error("cannot initialize DNSSEC-aware resolver, DNSSEC and DANE are not available", err)
 	}
 
 	cfg.String("hostname", true, true, "", &rt.hostname)
 	cfg.String("local_ip", false, false, "", &rt.localIP)
 	cfg.Bool("force_ipv4", false, false, &rt.ipv4)
-	cfg.Bool("debug", true, false, &rt.Log.Debug)
+	cfg.Bool("debug", true, false, &rt.log.Debug)
 	cfg.Custom("tls_client", true, false, func() (interface{}, error) {
 		return &tls.Config{}, nil
 	}, tls2.TLSClientBlock, &rt.tlsConfig)
@@ -126,7 +130,7 @@ func (rt *Target) Init(cfg *config.Map) error {
 		return p.L, nil
 	}, &rt.policies)
 	cfg.Custom("limits", false, false, func() (interface{}, error) {
-		return &limits.Group{}, nil
+		return limits.Empty(rt.log.Sublogger("limits")), nil
 	}, func(cfg *config.Map, n config.Node) (interface{}, error) {
 		var g *limits.Group
 		if err := modconfig.GroupFromNode("limits", n.Args, n, cfg.Globals, &g); err != nil {
@@ -142,12 +146,12 @@ func (rt *Target) Init(cfg *config.Map) error {
 	cfg.Duration("submission_timeout", false, false, 5*time.Minute, &rt.submissionTimeout)
 
 	poolCfg := pool.Config{
-		MaxKeys:             20000,
-		MaxConnsPerKey:      10,     // basically, max. amount of idle connections in cache
+		MaxKeys:             5000,
+		MaxConnsPerKey:      5,      // basically, max. amount of idle connections in cache
 		MaxConnLifetimeSec:  150,    // 2.5 mins, half of recommended idle time from RFC 5321
-		StaleKeyLifetimeSec: 60 * 5, // should be bigger than MaxConnLifetimeSec
+		StaleKeyLifetimeSec: 60 * 4, // make sure that cleanup runs before recommended idle time from RFC 5321
 	}
-	cfg.Int("conn_max_idle_count", false, false, 10, &poolCfg.MaxConnsPerKey)
+	cfg.Int("conn_max_idle_count", false, false, 5, &poolCfg.MaxConnsPerKey)
 	cfg.Int64("conn_max_idle_time", false, false, 150, &poolCfg.MaxConnLifetimeSec)
 
 	if _, err := cfg.Process(); err != nil {
@@ -183,7 +187,11 @@ func (rt *Target) Init(cfg *config.Map) error {
 	return nil
 }
 
-func (rt *Target) Close() error {
+func (rt *Target) Start() error {
+	return nil
+}
+
+func (rt *Target) Stop() error {
 	rt.pool.Close()
 
 	return nil
@@ -201,7 +209,7 @@ type remoteDelivery struct {
 	rt       *Target
 	mailFrom string
 	msgMeta  *module.MsgMetadata
-	Log      log.Logger
+	log      *log.Logger
 
 	recipients  []string
 	connections map[string]*mxConn
@@ -209,11 +217,11 @@ type remoteDelivery struct {
 	policies []module.DeliveryMXAuthPolicy
 }
 
-func (rt *Target) Start(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
+func (rt *Target) StartDelivery(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
 	policies := make([]module.DeliveryMXAuthPolicy, 0, len(rt.policies))
-	if !(msgMeta.TLSRequireOverride && rt.allowSecOverride) {
+	if !msgMeta.TLSRequireOverride || !rt.allowSecOverride {
 		for _, p := range rt.policies {
-			policies = append(policies, p.Start(msgMeta))
+			policies = append(policies, p.StartDelivery(msgMeta))
 		}
 	}
 
@@ -263,13 +271,13 @@ func (rt *Target) Start(ctx context.Context, msgMeta *module.MsgMetadata, mailFr
 		rt:          rt,
 		mailFrom:    mailFrom,
 		msgMeta:     msgMeta,
-		Log:         target.DeliveryLogger(rt.Log, msgMeta),
+		log:         target.DeliveryLogger(rt.log, msgMeta),
 		connections: map[string]*mxConn{},
 		policies:    policies,
 	}, nil
 }
 
-func (rd *remoteDelivery) AddRcpt(ctx context.Context, to string) error {
+func (rd *remoteDelivery) AddRcpt(ctx context.Context, to string, opts smtp.RcptOptions) error {
 	defer trace.StartRegion(ctx, "remote/AddRcpt").End()
 
 	if rd.msgMeta.Quarantine {
@@ -311,9 +319,10 @@ func (rd *remoteDelivery) AddRcpt(ctx context.Context, to string) error {
 		return err
 	}
 
-	if err := conn.Rcpt(ctx, to); err != nil {
+	if err := conn.Rcpt(ctx, to, opts); err != nil {
 		return moduleError(err)
 	}
+	conn.lastUseAt = time.Now()
 
 	rd.recipients = append(rd.recipients, to)
 	return nil
@@ -404,8 +413,6 @@ func (rd *remoteDelivery) BodyNonAtomic(ctx context.Context, c module.StatusColl
 	var wg sync.WaitGroup
 
 	for i, conn := range rd.connections {
-		i := i
-		conn := conn
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -417,13 +424,18 @@ func (rd *remoteDelivery) BodyNonAtomic(ctx context.Context, c module.StatusColl
 				}
 				return
 			}
-			defer bodyR.Close()
+			defer func() {
+				if err := bodyR.Close(); err != nil {
+					rd.log.Error("failed to close message buffer", err)
+				}
+			}()
 
 			err = conn.Data(ctx, header, bodyR)
 			for _, rcpt := range conn.Rcpts() {
 				c.SetStatus(rcpt, err)
 			}
 			rd.connections[i].errored = err != nil
+			conn.lastUseAt = time.Now()
 		}()
 	}
 
@@ -443,14 +455,15 @@ func (rd *remoteDelivery) Commit(ctx context.Context) error {
 func (rd *remoteDelivery) Close() error {
 	for _, conn := range rd.connections {
 		rd.rt.limits.ReleaseDest(conn.domain)
+		conn.takeDest = false
 		conn.transactions++
 
-		if conn.C == nil || conn.transactions > rd.rt.connReuseLimit || conn.C.Client() == nil || conn.errored {
-			rd.Log.Debugf("disconnected from %s (errored=%v,transactions=%v,disconnected before=%v)",
-				conn.ServerName(), conn.errored, conn.transactions, conn.C.Client() == nil)
-			conn.Close()
+		if !conn.Usable() {
+			rd.log.Debugf("disconnected %v from %s (errored=%v,transactions=%v,disconnected before=%v)",
+				conn.LocalAddr(), conn.ServerName(), conn.errored, conn.transactions, conn.Client() == nil)
+			rd.closeConn(conn)
 		} else {
-			rd.Log.Debugf("returning connection for %s to pool", conn.ServerName())
+			rd.log.Debugf("returning connection %v for %s to pool", conn.LocalAddr(), conn.ServerName())
 			rd.rt.pool.Return(conn.domain, conn)
 		}
 	}
@@ -479,5 +492,5 @@ func (rd *remoteDelivery) Close() error {
 }
 
 func init() {
-	module.Register("target.remote", New)
+	modules.Register("target.remote", New)
 }

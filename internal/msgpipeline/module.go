@@ -20,24 +20,26 @@ package msgpipeline
 
 import (
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 type Module struct {
 	instName string
-	log      log.Logger
+	log      *log.Logger
 	*MsgPipeline
 }
 
-func NewModule(modName, instName string, aliases, inlineArgs []string) (module.Module, error) {
+func NewModule(c *container.C, modName, instName string) (module.Module, error) {
 	return &Module{
-		log:      log.Logger{Name: "msgpipeline"},
+		log:      c.DefaultLogger.Sublogger(modName),
 		instName: instName,
 	}, nil
 }
 
-func (m *Module) Init(cfg *config.Map) error {
+func (m *Module) Configure(inlineArgs []string, cfg *config.Map) error {
 	var hostname string
 	cfg.String("hostname", true, true, "", &hostname)
 	cfg.Bool("debug", true, false, &m.log.Debug)
@@ -52,7 +54,7 @@ func (m *Module) Init(cfg *config.Map) error {
 		return err
 	}
 	m.MsgPipeline = p
-	m.MsgPipeline.Log = m.log
+	m.Log = m.log
 
 	return nil
 }
@@ -66,5 +68,5 @@ func (m *Module) InstanceName() string {
 }
 
 func init() {
-	module.Register("msgpipeline", NewModule)
+	modules.Register("msgpipeline", NewModule)
 }

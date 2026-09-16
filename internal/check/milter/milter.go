@@ -30,9 +30,11 @@ import (
 	"github.com/emersion/go-milter"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/target"
 )
 
@@ -43,22 +45,16 @@ type Check struct {
 	milterUrl string
 	failOpen  bool
 	instName  string
-	log       log.Logger
+	log       *log.Logger
 }
 
-func New(_, instName string, _, inlineArgs []string) (module.Module, error) {
-	c := &Check{
+func New(c *container.C, _, instName string) (module.Module, error) {
+	chk := &Check{
 		instName: instName,
-		log:      log.Logger{Name: modName, Debug: log.DefaultLogger.Debug},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}
-	switch len(inlineArgs) {
-	case 1:
-		c.milterUrl = inlineArgs[0]
-	case 0:
-	default:
-		return nil, fmt.Errorf("%s: unexpected amount of arguments, want 1 or 0", modName)
-	}
-	return c, nil
+
+	return chk, nil
 }
 
 func (c *Check) Name() string {
@@ -69,7 +65,15 @@ func (c *Check) InstanceName() string {
 	return c.instName
 }
 
-func (c *Check) Init(cfg *config.Map) error {
+func (c *Check) Configure(inlineArgs []string, cfg *config.Map) error {
+	switch len(inlineArgs) {
+	case 1:
+		c.milterUrl = inlineArgs[0]
+	case 0:
+	default:
+		return fmt.Errorf("%s: unexpected amount of arguments, want 1 or 0", modName)
+	}
+
 	cfg.String("endpoint", false, false, c.milterUrl, &c.milterUrl)
 	cfg.Bool("fail_open", false, false, &c.failOpen)
 	if _, err := cfg.Process(); err != nil {
@@ -90,9 +94,6 @@ func (c *Check) Init(cfg *config.Map) error {
 	default:
 		return fmt.Errorf("%s: scheme unsupported: %v", modName, endp.Scheme)
 	}
-	if endp.Path != "" {
-		return fmt.Errorf("%s: stray path in endpoint: %v", modName, endp)
-	}
 
 	c.cl = milter.NewClientWithOptions(endp.Network(), endp.Address(), milter.ClientOptions{
 		Dialer: &net.Dialer{
@@ -112,7 +113,7 @@ type state struct {
 	session    *milter.ClientSession
 	msgMeta    *module.MsgMetadata
 	skipChecks bool
-	log        log.Logger
+	log        *log.Logger
 }
 
 func (c *Check) CheckStateForMsg(ctx context.Context, msgMeta *module.MsgMetadata) (module.CheckState, error) {
@@ -445,5 +446,5 @@ var (
 )
 
 func init() {
-	module.Register(modName, New)
+	modules.Register(modName, New)
 }

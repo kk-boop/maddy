@@ -21,7 +21,6 @@ package dkim
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,19 +32,20 @@ import (
 	"github.com/foxcpp/go-mockdns"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
 	"github.com/foxcpp/maddy/internal/testutils"
 )
 
 func newTestModifier(t *testing.T, dir, keyAlgo string, domains []string) *Modifier {
-	mod, err := New("", "test", nil, nil)
+	mod, err := New(container.New(), "", "test")
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := mod.(*Modifier)
 	m.log = testutils.Logger(t, m.Name())
 
-	err = m.Init(config.NewMap(nil, config.Node{
+	err = m.Configure(nil, config.NewMap(nil, config.Node{
 		Children: []config.Node{
 			{
 				Name: "domains",
@@ -58,10 +58,6 @@ func newTestModifier(t *testing.T, dir, keyAlgo string, domains []string) *Modif
 			{
 				Name: "key_path",
 				Args: []string{filepath.Join(dir, "{domain}.key")},
-			},
-			{
-				Name: "require_sender_match",
-				Args: []string{"off"},
 			},
 			{
 				Name: "newkey_algo",
@@ -111,7 +107,7 @@ func verifyTestMsg(t *testing.T, keysPath string, expectedDomains []string, hdr 
 	domainsMap := make(map[string]bool)
 	zones := map[string]mockdns.Zone{}
 	for _, domain := range expectedDomains {
-		dnsRecord, err := ioutil.ReadFile(filepath.Join(keysPath, domain+".dns"))
+		dnsRecord, err := os.ReadFile(filepath.Join(keysPath, domain+".dns"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -167,11 +163,7 @@ func TestGenerateSignVerify(t *testing.T) {
 	test := func(domains []string, envelopeFrom string, expectDomain []string, keyAlgo string, headerCanon, bodyCanon dkim.Canonicalization, reload bool) {
 		t.Helper()
 
-		dir, err := ioutil.TempDir("", "maddy-tests-dkim-")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer os.RemoveAll(dir)
+		dir := t.TempDir()
 
 		m := newTestModifier(t, dir, keyAlgo, domains)
 		m.bodyCanon = bodyCanon

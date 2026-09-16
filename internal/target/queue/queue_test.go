@@ -24,7 +24,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -33,11 +33,14 @@ import (
 	"time"
 
 	"github.com/emersion/go-message/textproto"
+	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/maddy/framework/buffer"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
 	"github.com/foxcpp/maddy/internal/testutils"
+	"github.com/stretchr/testify/require"
 )
 
 // newTestQueue returns properly initialized Queue object usable for testing.
@@ -45,25 +48,18 @@ import (
 // See newTestQueueDir to create testing queue from an existing directory.
 // It is called responsibility to remove queue directory created by this function.
 func newTestQueue(t *testing.T, target module.DeliveryTarget) *Queue {
-	dir, err := ioutil.TempDir("", "maddy-tests-queue")
-	if err != nil {
-		t.Fatal("failed to create temporary directory for queue:", err)
-	}
-	return newTestQueueDir(t, target, dir)
+	return newTestQueueDir(t, target, t.TempDir())
 }
 
 func cleanQueue(t *testing.T, q *Queue) {
 	t.Log("--- queue.Close")
-	if err := q.Close(); err != nil {
+	if err := q.Stop(); err != nil {
 		t.Fatal("queue.Close:", err)
-	}
-	if err := os.RemoveAll(q.location); err != nil {
-		t.Fatal("os.RemoveAll", err)
 	}
 }
 
 func newTestQueueDir(t *testing.T, target module.DeliveryTarget, dir string) *Queue {
-	mod, _ := NewQueue("", "queue", nil, nil)
+	mod, _ := New(container.New(), "", "queue")
 	q := mod.(*Queue)
 	q.initialRetryTime = 0
 	q.retryTimeScale = 1
@@ -73,9 +69,9 @@ func newTestQueueDir(t *testing.T, target module.DeliveryTarget, dir string) *Qu
 	q.Target = target
 
 	if testing.Verbose() {
-		q.Log = testutils.Logger(t, "queue")
+		q.log = testutils.Logger(t, "queue")
 	} else {
-		q.Log = log.Logger{Out: log.NopOutput{}}
+		q.log = &log.NopLogger
 	}
 
 	if err := q.start(1); err != nil {
@@ -111,7 +107,7 @@ type unreliableTargetDeliveryPartial struct {
 	*unreliableTargetDelivery
 }
 
-func (utd *unreliableTargetDelivery) AddRcpt(ctx context.Context, rcptTo string) error {
+func (utd *unreliableTargetDelivery) AddRcpt(ctx context.Context, rcptTo string, _ smtp.RcptOptions) error {
 	if len(utd.ut.rcptFailures) > utd.ut.passedMessages {
 		rcptErrs := utd.ut.rcptFailures[utd.ut.passedMessages]
 		if err := rcptErrs[rcptTo]; err != nil {
@@ -129,7 +125,7 @@ func (utd *unreliableTargetDelivery) Body(ctx context.Context, header textproto.
 	}
 
 	r, _ := body.Open()
-	utd.msg.Body, _ = ioutil.ReadAll(r)
+	utd.msg.Body, _ = io.ReadAll(r)
 
 	if len(utd.ut.bodyFailures) > utd.ut.passedMessages {
 		return utd.ut.bodyFailures[utd.ut.passedMessages]
@@ -140,7 +136,7 @@ func (utd *unreliableTargetDelivery) Body(ctx context.Context, header textproto.
 
 func (utd *unreliableTargetDeliveryPartial) BodyNonAtomic(ctx context.Context, c module.StatusCollector, header textproto.Header, body buffer.Buffer) {
 	r, _ := body.Open()
-	utd.msg.Body, _ = ioutil.ReadAll(r)
+	utd.msg.Body, _ = io.ReadAll(r)
 
 	if len(utd.ut.bodyFailuresPartial) > utd.ut.passedMessages {
 		for rcpt, err := range utd.ut.bodyFailuresPartial[utd.ut.passedMessages] {
@@ -165,7 +161,7 @@ func (utd *unreliableTargetDelivery) Commit(ctx context.Context) error {
 	return nil
 }
 
-func (ut *unreliableTarget) Start(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
+func (ut *unreliableTarget) StartDelivery(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
 	if ut.bodyFailuresPartial != nil {
 		return &unreliableTargetDeliveryPartial{
 			&unreliableTargetDelivery{
@@ -207,7 +203,7 @@ func checkQueueDir(t *testing.T, q *Queue, expectedIDs []string) {
 		expectedMap[id] = false
 	}
 
-	dir, err := ioutil.ReadDir(q.location)
+	dir, err := os.ReadDir(q.location)
 	if err != nil {
 		t.Fatalf("failed to read queue directory: %v", err)
 	}
@@ -251,7 +247,7 @@ func TestQueueDelivery(t *testing.T) {
 
 	// Wait for the delivery to complete and stop processing.
 	msg := readMsgChanTimeout(t, dt.committed, 5*time.Second)
-	q.Close()
+	require.NoError(t, q.Stop())
 
 	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester1@example.org", "tester2@example.org"}, "")
 
@@ -275,7 +271,7 @@ func TestQueueDelivery_PermanentFail_NonPartial(t *testing.T) {
 
 	// Queue will abort a delivery if it fails for all recipients.
 	readMsgChanTimeout(t, dt.aborted, 5*time.Second)
-	q.Close()
+	require.NoError(t, q.Stop())
 
 	// Delivery is failed permanently, hence no retry should be rescheduled.
 	checkQueueDir(t, q, []string{})
@@ -302,7 +298,7 @@ func TestQueueDelivery_PermanentFail_Partial(t *testing.T) {
 	// Here delivery fails for recipients too, but this is reported using PartialDelivery.
 
 	readMsgChanTimeout(t, dt.aborted, 5*time.Second)
-	q.Close()
+	require.NoError(t, q.Stop())
 	checkQueueDir(t, q, []string{})
 }
 
@@ -328,7 +324,7 @@ func TestQueueDelivery_TemporaryFail(t *testing.T) {
 	msg := readMsgChanTimeout(t, dt.committed, 5*time.Second)
 	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester1@example.org", "tester2@example.org"}, "")
 
-	q.Close()
+	require.NoError(t, q.Stop())
 	// No more retries scheduled, queue storage is clear.
 	defer checkQueueDir(t, q, []string{})
 }
@@ -361,7 +357,7 @@ func TestQueueDelivery_TemporaryFail_Partial(t *testing.T) {
 	msg = readMsgChanTimeout(t, dt.committed, 5000*time.Second)
 	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester2@example.org"}, "")
 
-	q.Close()
+	require.NoError(t, q.Stop())
 	// No more retries scheduled, queue storage is clear.
 	checkQueueDir(t, q, []string{})
 }
@@ -401,7 +397,7 @@ func TestQueueDelivery_MultipleAttempts(t *testing.T) {
 	msg = readMsgChanTimeout(t, dt.committed, 5*time.Second)
 	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester2@example.org"}, "")
 
-	q.Close()
+	require.NoError(t, q.Stop())
 	// No more retries should be scheduled.
 	checkQueueDir(t, q, []string{})
 }
@@ -426,7 +422,7 @@ func TestQueueDelivery_PermanentRcptReject(t *testing.T) {
 	msg := readMsgChanTimeout(t, dt.committed, 5*time.Second)
 	testutils.CheckMsgID(t, msg, "tester@example.org", []string{"tester2@example.org"}, "")
 
-	q.Close()
+	require.NoError(t, q.Stop())
 	// No more retries should be scheduled.
 	checkQueueDir(t, q, []string{})
 }
@@ -460,7 +456,7 @@ func TestQueueDelivery_TemporaryRcptReject(t *testing.T) {
 	msg = readMsgChanTimeout(t, dt.committed, 5*time.Second)
 	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester1@example.org"}, "")
 
-	q.Close()
+	require.NoError(t, q.Stop())
 	// No more retries should be scheduled.
 	checkQueueDir(t, q, []string{})
 }
@@ -494,7 +490,7 @@ func TestQueueDelivery_SerializationRoundtrip(t *testing.T) {
 	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester2@example.org"}, "")
 
 	// Then stop it.
-	q.Close()
+	require.NoError(t, q.Stop())
 
 	// Make sure it is saved.
 	checkQueueDir(t, q, []string{deliveryID})
@@ -507,7 +503,7 @@ func TestQueueDelivery_SerializationRoundtrip(t *testing.T) {
 	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester1@example.org"}, "")
 
 	// Close it again.
-	q.Close()
+	require.NoError(t, q.Stop())
 	// No more retries should be scheduled.
 	checkQueueDir(t, q, []string{})
 }
@@ -541,7 +537,7 @@ func TestQueueDelivery_DeserlizationCleanUp(t *testing.T) {
 		msg := readMsgChanTimeout(t, dt.committed, 5*time.Second)
 		testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester2@example.org"}, "")
 
-		q.Close()
+		require.NoError(t, q.Stop())
 
 		if err := os.Remove(filepath.Join(q.location, deliveryID+fileSuffix)); err != nil {
 			t.Fatal(err)
@@ -549,7 +545,7 @@ func TestQueueDelivery_DeserlizationCleanUp(t *testing.T) {
 
 		// Dangling files should be removed during load.
 		q = newTestQueueDir(t, &dt, q.location)
-		q.Close()
+		require.NoError(t, q.Stop())
 
 		// Nothing should be left.
 		checkQueueDir(t, q, []string{})
@@ -612,12 +608,12 @@ func TestQueueDelivery_AbortNoDangling(t *testing.T) {
 		DontTraceSender: true,
 		ID:              encodedID,
 	}
-	delivery, err := q.Start(context.Background(), &ctx, "test3@example.org")
+	delivery, err := q.StartDelivery(context.Background(), &ctx, "test3@example.org")
 	if err != nil {
-		t.Fatalf("unexpected Start err: %v", err)
+		t.Fatalf("unexpected StartDelivery err: %v", err)
 	}
 	for _, rcpt := range [...]string{"test@example.org", "test2@example.org"} {
-		if err := delivery.AddRcpt(context.Background(), rcpt); err != nil {
+		if err := delivery.AddRcpt(context.Background(), rcpt, smtp.RcptOptions{}); err != nil {
 			t.Fatalf("unexpected AddRcpt err for %s: %v", rcpt, err)
 		}
 	}
@@ -792,12 +788,12 @@ func TestQueueDSN_RcptRewrite(t *testing.T) {
 		},
 		ID: encodedID,
 	}
-	delivery, err := q.Start(context.Background(), &ctx, "test3@example.org")
+	delivery, err := q.StartDelivery(context.Background(), &ctx, "test3@example.org")
 	if err != nil {
-		t.Fatalf("unexpected Start err: %v", err)
+		t.Fatalf("unexpected StartDelivery err: %v", err)
 	}
 	for _, rcpt := range [...]string{"test@example.org", "test2@example.org"} {
-		if err := delivery.AddRcpt(context.Background(), rcpt); err != nil {
+		if err := delivery.AddRcpt(context.Background(), rcpt, smtp.RcptOptions{}); err != nil {
 			t.Fatalf("unexpected AddRcpt err for %s: %v", rcpt, err)
 		}
 	}

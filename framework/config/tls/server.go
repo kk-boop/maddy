@@ -69,7 +69,10 @@ func TLSDirective(m *config.Map, node config.Node) (interface{}, error) {
 }
 
 func readTLSBlock(globals map[string]interface{}, blockNode config.Node) (*TLSConfig, error) {
-	baseCfg := tls.Config{}
+	baseCfg := tls.Config{
+		// Workaround for issue https://github.com/foxcpp/maddy/issues/730
+		SessionTicketsDisabled: true,
+	}
 
 	var loader module.TLSLoader
 	if len(blockNode.Args) > 0 {
@@ -95,7 +98,7 @@ func readTLSBlock(globals map[string]interface{}, blockNode config.Node) (*TLSCo
 	}, &loader)
 
 	childM.Custom("protocols", false, false, func() (interface{}, error) {
-		return [2]uint16{0, 0}, nil
+		return [2]uint16{tls.VersionTLS10, 0}, nil
 	}, TLSVersionsDirective, &tlsVersions)
 
 	childM.Custom("ciphers", false, false, func() (interface{}, error) {
@@ -108,10 +111,6 @@ func readTLSBlock(globals map[string]interface{}, blockNode config.Node) (*TLSCo
 
 	if _, err := childM.Process(); err != nil {
 		return nil, err
-	}
-
-	if len(baseCfg.CipherSuites) != 0 {
-		baseCfg.PreferServerCipherSuites = true
 	}
 
 	baseCfg.MinVersion = tlsVersions[0]

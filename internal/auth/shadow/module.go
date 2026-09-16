@@ -1,4 +1,5 @@
-//+build !windows
+//go:build !windows
+// +build !windows
 
 /*
 Maddy Mail Server - Composable all-in-one email server.
@@ -27,8 +28,10 @@ import (
 	"path/filepath"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/auth/external"
 )
 
@@ -37,16 +40,13 @@ type Auth struct {
 	useHelper  bool
 	helperPath string
 
-	Log log.Logger
+	log *log.Logger
 }
 
-func New(modName, instName string, _, inlineArgs []string) (module.Module, error) {
-	if len(inlineArgs) != 0 {
-		return nil, errors.New("shadow: inline arguments are not used")
-	}
+func New(c *container.C, modName, instName string) (module.Module, error) {
 	return &Auth{
 		instName: instName,
-		Log:      log.Logger{Name: modName},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
@@ -58,8 +58,12 @@ func (a *Auth) InstanceName() string {
 	return a.instName
 }
 
-func (a *Auth) Init(cfg *config.Map) error {
-	cfg.Bool("debug", true, false, &a.Log.Debug)
+func (a *Auth) Configure(inlineArgs []string, cfg *config.Map) error {
+	if len(inlineArgs) != 0 {
+		return errors.New("shadow: inline arguments are not used")
+	}
+
+	cfg.Bool("debug", true, false, &a.log.Debug)
 	cfg.Bool("use_helper", false, false, &a.useHelper)
 	if _, err := cfg.Process(); err != nil {
 		return err
@@ -78,7 +82,9 @@ func (a *Auth) Init(cfg *config.Map) error {
 			}
 			return fmt.Errorf("shadow: can't read /etc/shadow: %v", err)
 		}
-		f.Close()
+		if err := f.Close(); err != nil {
+			a.log.Error("can't close /etc/shadow file", err)
+		}
 	}
 
 	return nil
@@ -133,5 +139,5 @@ func (a *Auth) AuthPlain(username, password string) error {
 }
 
 func init() {
-	module.Register("auth.shadow", New)
+	modules.Register("auth.shadow", New)
 }

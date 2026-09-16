@@ -26,6 +26,8 @@ import (
 	"github.com/emersion/go-message/textproto"
 	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
+	"github.com/stretchr/testify/assert"
 )
 
 func init() {
@@ -49,17 +51,17 @@ func TestSubmissionPrepare(t *testing.T) {
 			}
 		}
 
-		endp := testEndpoint(t, "submission", &module.Dummy{}, &module.Dummy{}, nil, nil)
+		endp := testEndpoint(t, "submission", &modules.Dummy{}, &modules.Dummy{}, nil, nil)
 		defer func() {
 			// Synchronize the endpoint initialization.
 			// Otherwise Close will race with Serve called by setupListeners.
 			cl, _ := smtp.Dial("127.0.0.1:" + testPort)
-			cl.Close()
+			assert.NoError(t, cl.Close())
 
-			endp.Close()
+			assert.NoError(t, endp.Stop())
 		}()
 
-		session, err := endp.NewSession(smtp.ConnectionState{}, "")
+		session, err := endp.NewSession(nil)
 		if err != nil {
 			t.Fatal(err)
 		}

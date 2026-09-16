@@ -23,8 +23,10 @@ import (
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
 	modconfig "github.com/foxcpp/maddy/framework/config/module"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 // Group wraps multiple modifiers and runs them serially.
@@ -34,17 +36,17 @@ import (
 type Group struct {
 	instName string
 	Filters  []module.IMAPFilter
-	log      log.Logger
+	log      *log.Logger
 }
 
-func NewGroup(_, instName string, _, _ []string) (module.Module, error) {
+func NewGroup(c *container.C, modName, instName string) (module.Module, error) {
 	return &Group{
 		instName: instName,
-		log:      log.Logger{Name: "imap_filters", Debug: log.DefaultLogger.Debug},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
-func (g *Group) IMAPFilter(accountName string, meta *module.MsgMetadata, hdr textproto.Header, body buffer.Buffer) (folder string, flags []string, err error) {
+func (g *Group) IMAPFilter(accountName string, rcptTo string, meta *module.MsgMetadata, hdr textproto.Header, body buffer.Buffer) (folder string, flags []string, err error) {
 	if g == nil {
 		return "", nil, nil
 	}
@@ -53,7 +55,7 @@ func (g *Group) IMAPFilter(accountName string, meta *module.MsgMetadata, hdr tex
 		finalFlags  = make([]string, 0, len(g.Filters))
 	)
 	for _, f := range g.Filters {
-		folder, flags, err := f.IMAPFilter(accountName, meta, hdr, body)
+		folder, flags, err := f.IMAPFilter(accountName, rcptTo, meta, hdr, body)
 		if err != nil {
 			g.log.Error("IMAP filter failed", err)
 			continue
@@ -66,7 +68,7 @@ func (g *Group) IMAPFilter(accountName string, meta *module.MsgMetadata, hdr tex
 	return finalFolder, finalFlags, nil
 }
 
-func (g *Group) Init(cfg *config.Map) error {
+func (g *Group) Configure(inlineArgs []string, cfg *config.Map) error {
 	for _, node := range cfg.Block.Children {
 		mod, err := modconfig.IMAPFilter(cfg.Globals, append([]string{node.Name}, node.Args...), node)
 		if err != nil {
@@ -88,5 +90,5 @@ func (g *Group) InstanceName() string {
 }
 
 func init() {
-	module.Register("imap_filters", NewGroup)
+	modules.Register("imap_filters", NewGroup)
 }

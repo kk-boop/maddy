@@ -32,8 +32,10 @@ import (
 	"github.com/emersion/go-message/textproto"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 const modName = "imap.filter.command"
@@ -42,14 +44,14 @@ var placeholderRe = regexp.MustCompile(`{[a-zA-Z0-9_]+?}`)
 
 type Check struct {
 	instName string
-	log      log.Logger
+	log      *log.Logger
 
 	cmd     string
 	cmdArgs []string
 }
 
-func (c *Check) IMAPFilter(accountName string, msgMeta *module.MsgMetadata, hdr textproto.Header, body buffer.Buffer) (folder string, flags []string, err error) {
-	cmd, args := c.expandCommand(msgMeta, accountName)
+func (c *Check) IMAPFilter(accountName string, rcptTo string, msgMeta *module.MsgMetadata, hdr textproto.Header, body buffer.Buffer) (folder string, flags []string, err error) {
+	cmd, args := c.expandCommand(msgMeta, accountName, rcptTo, hdr)
 
 	var buf bytes.Buffer
 	_ = textproto.WriteHeader(&buf, hdr)
@@ -61,20 +63,13 @@ func (c *Check) IMAPFilter(accountName string, msgMeta *module.MsgMetadata, hdr 
 	return c.run(cmd, args, io.MultiReader(bytes.NewReader(buf.Bytes()), bR))
 }
 
-func New(_, instName string, _, inlineArgs []string) (module.Module, error) {
-	c := &Check{
+func New(c *container.C, _, instName string) (module.Module, error) {
+	chk := &Check{
 		instName: instName,
-		log:      log.Logger{Name: modName, Debug: log.DefaultLogger.Debug},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}
 
-	if len(inlineArgs) == 0 {
-		return nil, errors.New("command: at least one argument is required (command name)")
-	}
-
-	c.cmd = inlineArgs[0]
-	c.cmdArgs = inlineArgs[1:]
-
-	return c, nil
+	return chk, nil
 }
 
 func (c *Check) Name() string {
@@ -85,7 +80,14 @@ func (c *Check) InstanceName() string {
 	return c.instName
 }
 
-func (c *Check) Init(cfg *config.Map) error {
+func (c *Check) Configure(inlineArgs []string, cfg *config.Map) error {
+	if len(inlineArgs) == 0 {
+		return errors.New("command: at least one argument is required (command name)")
+	}
+
+	c.cmd = inlineArgs[0]
+	c.cmdArgs = inlineArgs[1:]
+
 	// Check whether the inline argument command is usable.
 	if _, err := exec.LookPath(c.cmd); err != nil {
 		return fmt.Errorf("command: %w", err)
@@ -95,7 +97,7 @@ func (c *Check) Init(cfg *config.Map) error {
 	return err
 }
 
-func (c *Check) expandCommand(msgMeta *module.MsgMetadata, accountName string) (string, []string) {
+func (c *Check) expandCommand(msgMeta *module.MsgMetadata, accountName string, rcptTo string, hdr textproto.Header) (string, []string) {
 	expArgs := make([]string, len(c.cmdArgs))
 
 	for i, arg := range c.cmdArgs {
@@ -136,6 +138,16 @@ func (c *Check) expandCommand(msgMeta *module.MsgMetadata, accountName string) (
 				return msgMeta.ID
 			case "{sender}":
 				return msgMeta.OriginalFrom
+			case "{rcpt_to}":
+				return rcptTo
+			case "{original_rcpt_to}":
+				oldestOriginalRcpt := rcptTo
+				for originalRcpt, ok := rcptTo, true; ok; originalRcpt, ok = msgMeta.OriginalRcpts[originalRcpt] {
+					oldestOriginalRcpt = originalRcpt
+				}
+				return oldestOriginalRcpt
+			case "{subject}":
+				return hdr.Get("Subject")
 			case "{account_name}":
 				return accountName
 			}
@@ -193,5 +205,5 @@ func (c *Check) run(cmdName string, args []string, stdin io.Reader) (string, []s
 }
 
 func init() {
-	module.Register(modName, New)
+	modules.Register(modName, New)
 }

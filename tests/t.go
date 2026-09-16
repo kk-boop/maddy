@@ -25,9 +25,9 @@ package tests
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"os"
@@ -35,10 +35,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/foxcpp/go-mockdns"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -59,13 +62,16 @@ type T struct {
 	portsRev map[uint16]string
 
 	servProc *exec.Cmd
+
+	reloadedChan chan struct{}
 }
 
 func NewT(t *testing.T) *T {
 	return &T{
-		T:        t,
-		ports:    map[string]uint16{},
-		portsRev: map[uint16]string{},
+		T:            t,
+		ports:        map[string]uint16{},
+		portsRev:     map[uint16]string{},
+		reloadedChan: make(chan struct{}, 1),
 	}
 }
 
@@ -74,11 +80,21 @@ func NewT(t *testing.T) *T {
 func (t *T) Config(cfg string) {
 	t.Helper()
 
-	if t.servProc != nil {
-		panic("tests: Config called after Run")
-	}
-
 	t.cfg = cfg
+
+	if t.servProc != nil {
+		t.Log("Reloading configuration for running server...")
+
+		configPreable := "state_dir " + filepath.Join(t.testDir, "statedir") + "\n" +
+			"runtime_dir " + filepath.Join(t.testDir, "runtimedir") + "\n\n"
+
+		err := os.WriteFile(filepath.Join(t.testDir, "maddy.conf"), []byte(configPreable+t.cfg), os.ModePerm)
+		if err != nil {
+			t.Fatal("Test configuration failed:", err)
+		}
+
+		t.reloadConfig()
+	}
 }
 
 // DNS sets the DNS zones to emulate for the tested server instance.
@@ -97,15 +113,28 @@ func (t *T) DNS(zones map[string]mockdns.Zone) {
 
 	if t.dnsServ != nil {
 		t.Log("NOTE: Multiple DNS calls, replacing the server instance...")
-		t.dnsServ.Close()
+		require.NoError(t, t.dnsServ.Close())
 	}
 
-	dnsServ, err := mockdns.NewServer(zones, false)
+	dnsServ, err := mockdns.NewServerWithLogger(zones, t, false)
 	if err != nil {
 		t.Fatal("Test configuration failed:", err)
 	}
 	dnsServ.Log = t
 	t.dnsServ = dnsServ
+
+	t.Cleanup(func() {
+		if t.dnsServ == nil {
+			return
+		}
+
+		// Shutdown the DNS server after maddy to make sure it will not spend time
+		// timing out queries.
+		if err := t.dnsServ.Close(); err != nil {
+			t.Log("Unable to stop the DNS server:", err)
+		}
+		t.dnsServ = nil
+	})
 }
 
 // Port allocates the random TCP port for use by test. It will made accessible
@@ -130,14 +159,7 @@ func (t *T) Env(kv string) {
 	t.env = append(t.env, kv)
 }
 
-// Run completes the configuration of test environment and starts the test server.
-//
-// T.Close should be called by the end of test to release any resources and
-// shutdown the server.
-//
-// The parameter waitListeners specifies the amount of listeners the server is
-// supposed to configure. Run() will block before all of them are up.
-func (t *T) Run(waitListeners int) {
+func (t *T) ensureCanRun() {
 	if t.cfg == "" {
 		panic("tests: Run called without configuration set")
 	}
@@ -150,63 +172,63 @@ func (t *T) Run(waitListeners int) {
 	}
 
 	// Setup file system, create statedir, runtimedir, write out config.
-	testDir, err := ioutil.TempDir("", "maddy-tests-")
-	if err != nil {
-		t.Fatal("Test configuration failed:", err)
-	}
-	t.testDir = testDir
+	if t.testDir == "" {
+		testDir, err := os.MkdirTemp("", "maddy-tests-")
+		if err != nil {
+			t.Fatal("Test configuration failed:", err)
+		}
+		t.testDir = testDir
+		t.Log("using", t.testDir)
 
-	t.Log("Using", t.testDir)
-
-	defer func() {
-		if !t.Failed() {
-			return
+		if err := os.MkdirAll(filepath.Join(t.testDir, "statedir"), os.ModePerm); err != nil {
+			t.Fatal("Test configuration failed:", err)
+		}
+		if err := os.MkdirAll(filepath.Join(t.testDir, "runtimedir"), os.ModePerm); err != nil {
+			t.Fatal("Test configuration failed:", err)
 		}
 
-		// Clean-up on test failure (if Run failed somewhere)
+		t.Cleanup(func() {
+			if !t.Failed() {
+				return
+			}
 
-		t.dnsServ.Close()
-		t.dnsServ = nil
-
-		os.RemoveAll(t.testDir)
-		t.testDir = ""
-	}()
-
-	if err := os.MkdirAll(filepath.Join(t.testDir, "statedir"), os.ModePerm); err != nil {
-		t.Fatal("Test configuration failed:", err)
-	}
-	if err := os.MkdirAll(filepath.Join(t.testDir, "runtimedir"), os.ModePerm); err != nil {
-		t.Fatal("Test configuration failed:", err)
+			t.Log("removing", t.testDir)
+			assert.NoError(t, os.RemoveAll(t.testDir))
+			t.testDir = ""
+		})
 	}
 
 	configPreable := "state_dir " + filepath.Join(t.testDir, "statedir") + "\n" +
-		"runtime_dir " + filepath.Join(t.testDir, "runtime") + "\n\n"
+		"runtime_dir " + filepath.Join(t.testDir, "runtimedir") + "\n\n"
 
-	err = ioutil.WriteFile(filepath.Join(t.testDir, "maddy.conf"), []byte(configPreable+t.cfg), os.ModePerm)
+	err := os.WriteFile(filepath.Join(t.testDir, "maddy.conf"), []byte(configPreable+t.cfg), os.ModePerm)
 	if err != nil {
 		t.Fatal("Test configuration failed:", err)
 	}
+}
 
+func (t *T) buildCmd(additionalArgs ...string) *exec.Cmd {
 	// Assigning 0 by default will make outbound SMTP unusable.
 	remoteSmtp := "0"
 	if port := t.ports["remote_smtp"]; port != 0 {
 		remoteSmtp = strconv.Itoa(int(port))
 	}
 
-	cmd := exec.Command(TestBinary,
-		"-config", filepath.Join(t.testDir, "maddy.conf"),
+	args := []string{"-config", filepath.Join(t.testDir, "maddy.conf"),
 		"-debug.smtpport", remoteSmtp,
 		"-debug.dnsoverride", t.dnsServ.LocalAddr().String(),
-		"-log", "stderr")
+	}
 
 	if CoverageOut != "" {
-		cmd.Args = append(cmd.Args, "-test.coverprofile", CoverageOut+"."+strconv.FormatInt(time.Now().UnixNano(), 16))
+		args = append(args, "-test.coverprofile", CoverageOut+"."+strconv.FormatInt(time.Now().UnixNano(), 16))
 	}
 	if DebugLog {
-		cmd.Args = append(cmd.Args, "-debug")
+		args = append(args, "-debug")
 	}
 
-	t.Logf("launching %v", cmd.Args)
+	args = append(args, additionalArgs...)
+
+	cmd := exec.Command(TestBinary, args...)
 
 	pwd, err := os.Getwd()
 	if err != nil {
@@ -218,12 +240,72 @@ func (t *T) Run(waitListeners int) {
 	cmd.Env = append(cmd.Env,
 		"TEST_PWD="+pwd,
 		"TEST_STATE_DIR="+filepath.Join(t.testDir, "statedir"),
-		"TEST_RUNTIME_DIR="+filepath.Join(t.testDir, "statedir"),
+		"TEST_RUNTIME_DIR="+filepath.Join(t.testDir, "runtimedir"),
 	)
 	for name, port := range t.ports {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("TEST_PORT_%s=%d", name, port))
 	}
 	cmd.Env = append(cmd.Env, t.env...)
+
+	return cmd
+}
+
+func (t *T) MustRunCLIGroup(args ...[]string) {
+	t.ensureCanRun()
+
+	wg := sync.WaitGroup{}
+	for _, arg := range args {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			_, err := t.RunCLI(arg...)
+			if err != nil {
+				t.Printf("maddy %v: %v", arg, err)
+				t.Fail()
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func (t *T) MustRunCLI(args ...string) string {
+	s, err := t.RunCLI(args...)
+	if err != nil {
+		t.Fatalf("maddy %v: %v", args, err)
+	}
+	return s
+}
+
+func (t *T) RunCLI(args ...string) (string, error) {
+	t.ensureCanRun()
+	cmd := t.buildCmd(args...)
+
+	var stderr, stdout bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = &stdout
+
+	t.Log("launching maddy", cmd.Args)
+	if err := cmd.Run(); err != nil {
+		t.Log("Stderr:", stderr.String())
+		t.Fatal("Test configuration failed:", err)
+	}
+
+	t.Log("Stderr:", stderr.String())
+
+	return stdout.String(), nil
+}
+
+// Run completes the configuration of test environment and starts the test server.
+//
+// T.Close should be called by the end of test to release any resources and
+// shutdown the server.
+//
+// The parameter waitListeners specifies the amount of listeners the server is
+// supposed to configure. Run() will block before all of them are up.
+func (t *T) Run(waitListeners int) {
+	t.ensureCanRun()
+	cmd := t.buildCmd("run")
 
 	// Capture maddy log and redirect it.
 	logOut, err := cmd.StderrPipe()
@@ -231,40 +313,47 @@ func (t *T) Run(waitListeners int) {
 		t.Fatal("Test configuration failed:", err)
 	}
 
+	t.Log("launching maddy", cmd.Args)
 	if err := cmd.Start(); err != nil {
 		t.Fatal("Test configuration failed:", err)
 	}
 
-	// Log scanning goroutine checks for the "listening" messages and sends 'true'
-	// on the channel each time.
-	listeningMsg := make(chan bool)
+	serverStarted := make(chan bool)
 
 	go func() {
-		defer logOut.Close()
-		defer close(listeningMsg)
+		defer close(serverStarted)
 		scnr := bufio.NewScanner(logOut)
 		for scnr.Scan() {
 			line := scnr.Text()
 
-			if strings.Contains(line, "listening on") {
-				listeningMsg <- true
-				line += " (test runner>listener wait trigger<)"
+			t.Log("maddy:", line)
+
+			if strings.HasPrefix(line, "server started") {
+				serverStarted <- true
 			}
 
-			t.Log("maddy:", line)
+			if strings.HasPrefix(line, "new server started") {
+				select {
+				case t.reloadedChan <- struct{}{}:
+					t.Log("server reload confirmed, continuing test")
+				default:
+					t.Log("unexpected reloads detected")
+					t.Fail()
+				}
+			}
 		}
 		if err := scnr.Err(); err != nil {
 			t.Log("stderr I/O error:", err)
 		}
 	}()
 
-	for i := 0; i < waitListeners; i++ {
-		if !<-listeningMsg {
-			t.Fatal("Log ended before all expected listeners are up. Start-up error?")
-		}
+	if !<-serverStarted {
+		t.Fatal("Log ended before all expected listeners are up. Start-up error?")
 	}
 
 	t.servProc = cmd
+
+	t.Cleanup(t.killServer)
 }
 
 func (t *T) StateDir() string {
@@ -275,10 +364,10 @@ func (t *T) RuntimeDir() string {
 	return filepath.Join(t.testDir, "statedir")
 }
 
-func (t *T) Close() {
+func (t *T) killServer() {
 	if err := t.servProc.Process.Signal(os.Interrupt); err != nil {
 		t.Log("Unable to kill the server process:", err)
-		os.RemoveAll(t.testDir)
+		assert.NoError(t, os.RemoveAll(t.testDir))
 		return // Return, as now it is pointless to wait for it.
 	}
 
@@ -300,13 +389,10 @@ func (t *T) Close() {
 		t.Log("Failed to remove test directory:", err)
 	}
 	t.testDir = ""
+}
 
-	// Shutdown the DNS server after maddy to make sure it will not spend time
-	// timing out queries.
-	if err := t.dnsServ.Close(); err != nil {
-		t.Log("Unable to stop the DNS server:", err)
-	}
-	t.dnsServ = nil
+func (t *T) Close() {
+	t.Log("close is no-op")
 }
 
 // Printf implements Logger interfaces used by some libraries.

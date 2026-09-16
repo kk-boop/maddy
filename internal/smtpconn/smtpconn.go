@@ -16,7 +16,7 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-// The package smtpconn contains the code shared between target.smtp and
+// Package smtpconn contains the code shared between target.smtp and
 // remote modules.
 //
 // It implements the wrapper over the SMTP connection (go-smtp.Client) object
@@ -73,12 +73,20 @@ type C struct {
 	TLSConfig *tls.Config
 
 	// Logger to use for debug log and certain errors.
-	Log log.Logger
+	Log *log.Logger
 
 	// Include the remote server address in SMTP status messages in the form
 	// "ADDRESS said: ..."
 	AddrInSMTPMsg bool
 
+	// Treat DNS resolution errors returned while connecting to the configured
+	// endpoint as temporary delivery errors.
+	//
+	// This is useful for explicitly configured downstream SMTP/LMTP targets where
+	// the endpoint is mail infrastructure, not recipient-domain DNS.
+	DNSErrorsTemporary bool
+
+	conn       net.Conn
 	serverName string
 	cl         *smtp.Client
 	rcpts      []string
@@ -134,9 +142,17 @@ func (c *C) wrapClientErr(err error, serverName string) error {
 			reason, misc := exterrors.UnwrapDNSErr(err)
 			misc["remote_server"] = err.Addr
 			misc["io_op"] = err.Op
+
+			code := exterrors.SMTPCode(err, 450, 550)
+			enhancedCode := exterrors.SMTPEnchCode(err, exterrors.EnhancedCode{0, 4, 4})
+			if c.DNSErrorsTemporary {
+				code = 451
+				enhancedCode = exterrors.EnhancedCode{4, 4, 4}
+			}
+
 			return &exterrors.SMTPError{
-				Code:         exterrors.SMTPCode(err, 450, 550),
-				EnhancedCode: exterrors.SMTPEnchCode(err, exterrors.EnhancedCode{0, 4, 4}),
+				Code:         code,
+				EnhancedCode: enhancedCode,
 				Message:      "DNS error",
 				Err:          err,
 				Reason:       reason,
@@ -163,26 +179,36 @@ func (c *C) wrapClientErr(err error, serverName string) error {
 // Connect actually estabilishes the network connection with the remote host,
 // executes HELO/EHLO and optionally STARTTLS command.
 func (c *C) Connect(ctx context.Context, endp config.Endpoint, starttls bool, tlsConfig *tls.Config) (didTLS bool, err error) {
-	didTLS, cl, err := c.attemptConnect(ctx, false, endp, starttls, tlsConfig)
+	didTLS, cl, conn, err := c.attemptConnect(ctx, false, endp, starttls, tlsConfig)
 	if err != nil {
 		return false, c.wrapClientErr(err, endp.Host)
 	}
 
 	c.serverName = endp.Host
 	c.cl = cl
+	c.conn = conn
+
+	c.Log.DebugMsg("connected", "remote_server", c.serverName,
+		"local_addr", c.LocalAddr(), "remote_addr", c.RemoteAddr())
+
 	return didTLS, nil
 }
 
 // ConnectLMTP estabilishes the network connection with the remote host and
 // sends LHLO command, negotiating LMTP use.
 func (c *C) ConnectLMTP(ctx context.Context, endp config.Endpoint, starttls bool, tlsConfig *tls.Config) (didTLS bool, err error) {
-	didTLS, cl, err := c.attemptConnect(ctx, true, endp, starttls, tlsConfig)
+	didTLS, cl, conn, err := c.attemptConnect(ctx, true, endp, starttls, tlsConfig)
 	if err != nil {
 		return false, c.wrapClientErr(err, endp.Host)
 	}
 
 	c.serverName = endp.Host
 	c.cl = cl
+	c.conn = conn
+
+	c.Log.DebugMsg("connected", "remote_server", c.serverName,
+		"local_addr", c.LocalAddr(), "remote_addr", c.RemoteAddr())
+
 	return didTLS, nil
 }
 
@@ -203,14 +229,32 @@ func (err TLSError) Unwrap() error {
 	return err.Err
 }
 
-func (c *C) attemptConnect(ctx context.Context, lmtp bool, endp config.Endpoint, starttls bool, tlsConfig *tls.Config) (didTLS bool, cl *smtp.Client, err error) {
-	var conn net.Conn
+func (c *C) LocalAddr() net.Addr {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.LocalAddr()
+}
 
+func (c *C) RemoteAddr() net.Addr {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.RemoteAddr()
+}
+
+func (c *C) closeClient(cl *smtp.Client) {
+	if err := cl.Close(); err != nil {
+		c.Log.Error("client connection close failed", err)
+	}
+}
+
+func (c *C) attemptConnect(ctx context.Context, lmtp bool, endp config.Endpoint, starttls bool, tlsConfig *tls.Config) (didTLS bool, cl *smtp.Client, conn net.Conn, err error) {
 	dialCtx, cancel := context.WithTimeout(ctx, c.ConnectTimeout)
 	conn, err = c.Dialer(dialCtx, endp.Network(), endp.Address())
 	cancel()
 	if err != nil {
-		return false, nil, err
+		return false, nil, nil, fmt.Errorf("dialer: %w", err)
 	}
 
 	if endp.IsTLS() {
@@ -222,13 +266,9 @@ func (c *C) attemptConnect(ctx context.Context, lmtp bool, endp config.Endpoint,
 	c.lmtp = lmtp
 	// This uses initial greeting timeout of 5 minutes (hardcoded).
 	if lmtp {
-		cl, err = smtp.NewClientLMTP(conn, endp.Host)
+		cl = smtp.NewClientLMTP(conn)
 	} else {
-		cl, err = smtp.NewClient(conn, endp.Host)
-	}
-	if err != nil {
-		conn.Close()
-		return false, nil, err
+		cl = smtp.NewClient(conn)
 	}
 
 	cl.CommandTimeout = c.CommandTimeout
@@ -236,16 +276,19 @@ func (c *C) attemptConnect(ctx context.Context, lmtp bool, endp config.Endpoint,
 
 	// i18n: hostname is already expected to be in A-labels form.
 	if err := cl.Hello(c.Hostname); err != nil {
-		cl.Close()
-		return false, nil, err
+		c.closeClient(cl)
+		return false, nil, nil, err
 	}
 
-	if endp.IsTLS() || !starttls {
-		return endp.IsTLS(), cl, nil
+	if !starttls {
+		return false, cl, conn, nil
 	}
 
 	if ok, _ := cl.Extension("STARTTLS"); !ok {
-		return false, cl, nil
+		if err := cl.Quit(); err != nil {
+			c.closeClient(cl)
+		}
+		return false, nil, nil, fmt.Errorf("TLS required but unsupported by downstream")
 	}
 
 	cfg := tlsConfig.Clone()
@@ -256,13 +299,25 @@ func (c *C) attemptConnect(ctx context.Context, lmtp bool, endp config.Endpoint,
 		// *after* the handshake (e.g. PKI verification fail), we don't log the error in
 		// this case though.
 		if err := cl.Quit(); err != nil {
-			cl.Close()
+			c.closeClient(cl)
 		}
 
-		return false, nil, TLSError{err}
+		return false, nil, nil, TLSError{err}
 	}
 
-	return true, cl, nil
+	// Re-do HELO using our hostname instead of localhost.
+	if err := cl.Hello(c.Hostname); err != nil {
+		c.closeClient(cl)
+
+		var tlsErr *tls.CertificateVerificationError
+		if errors.As(err, &tlsErr) {
+			return false, nil, nil, TLSError{Err: tlsErr}
+		}
+
+		return false, nil, nil, err
+	}
+
+	return true, cl, conn, nil
 }
 
 // Mail sends the MAIL FROM command to the remote server.
@@ -311,7 +366,6 @@ func (c *C) Mail(ctx context.Context, from string, opts smtp.MailOptions) error 
 		return c.wrapClientErr(err, c.serverName)
 	}
 
-	c.Log.DebugMsg("connected", "remote_server", c.serverName)
 	return nil
 }
 
@@ -336,10 +390,14 @@ func (c *C) IsLMTP() bool {
 //
 // If the address is non-ASCII and cannot be converted to ASCII and the remote
 // server does not support SMTPUTF8, error will be returned.
-func (c *C) Rcpt(ctx context.Context, to string) error {
+func (c *C) Rcpt(ctx context.Context, to string, opts smtp.RcptOptions) error {
 	defer trace.StartRegion(ctx, "smtpconn/RCPT TO").End()
 
-	// If necessary, the extension flag is enabled in Start.
+	outOpts := &smtp.RcptOptions{
+		// TODO: DSN support
+	}
+
+	// If necessary, the extension flag is enabled in StartDelivery.
 	if ok, _ := c.cl.Extension("SMTPUTF8"); !address.IsASCII(to) && !ok {
 		var err error
 		to, err = address.ToASCII(to)
@@ -356,7 +414,7 @@ func (c *C) Rcpt(ctx context.Context, to string) error {
 		}
 	}
 
-	if err := c.cl.Rcpt(to); err != nil {
+	if err := c.cl.Rcpt(to, outOpts); err != nil {
 		return c.wrapClientErr(err, c.serverName)
 	}
 
@@ -482,11 +540,26 @@ func (c *C) Noop() error {
 	return c.cl.Noop()
 }
 
-// Close sends the QUIT command, if it fail - it directly closes the
+// Close sends the QUIT command, if it fails - it directly closes the
 // connection.
 func (c *C) Close() error {
+	c.cl.CommandTimeout = 5 * time.Second
+
 	if err := c.cl.Quit(); err != nil {
-		c.Log.Error("QUIT error", c.wrapClientErr(err, c.serverName))
+		var smtpErr *smtp.SMTPError
+		var netErr *net.OpError
+		if errors.As(err, &smtpErr) && smtpErr.Code == 421 {
+			// 421 "Service not available" is typically sent
+			// when idle timeout happens.
+			c.Log.DebugMsg("QUIT error", "reason", c.wrapClientErr(err, c.serverName))
+		} else if errors.As(err, &netErr) &&
+			(netErr.Timeout() || netErr.Err.Error() == "write: broken pipe" || netErr.Err.Error() == "read: connection reset") {
+			// The case for silently closed connections.
+			c.Log.DebugMsg("QUIT error", "reason", c.wrapClientErr(err, c.serverName))
+		} else {
+			c.Log.Error("QUIT error", c.wrapClientErr(err, c.serverName))
+		}
+
 		return c.cl.Close()
 	}
 
@@ -499,8 +572,8 @@ func (c *C) Close() error {
 // DirectClose closes the underlying connection without sending the QUIT
 // command.
 func (c *C) DirectClose() error {
-	c.cl.Close()
+	cl := c.cl
 	c.cl = nil
 	c.serverName = ""
-	return nil
+	return cl.Close()
 }

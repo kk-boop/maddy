@@ -21,16 +21,19 @@ package testutils
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"reflect"
 	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/maddy/framework/exterrors"
+	"github.com/stretchr/testify/require"
 )
 
 type SMTPMessage struct {
@@ -38,7 +41,7 @@ type SMTPMessage struct {
 	Opts     smtp.MailOptions
 	To       []string
 	Data     []byte
-	State    *smtp.ConnectionState
+	Conn     *smtp.Conn
 	AuthUser string
 	AuthPass string
 }
@@ -54,18 +57,25 @@ type SMTPBackend struct {
 	RcptErr     map[string]error
 	DataErr     error
 	LMTPDataErr []error
+
+	ActiveSessionsCounter atomic.Int32
 }
 
-func (be *SMTPBackend) NewSession(state smtp.ConnectionState, _ string) (smtp.Session, error) {
+func (be *SMTPBackend) NewSession(conn *smtp.Conn) (smtp.Session, error) {
 	be.SessionCounter++
+	be.ActiveSessionsCounter.Add(1)
 	if be.SourceEndpoints == nil {
 		be.SourceEndpoints = make(map[string]struct{})
 	}
-	be.SourceEndpoints[state.RemoteAddr.String()] = struct{}{}
+	be.SourceEndpoints[conn.Conn().RemoteAddr().String()] = struct{}{}
 	return &session{
 		backend: be,
-		state:   &state,
+		conn:    conn,
 	}, nil
+}
+
+func (be *SMTPBackend) ConnectionCount() int {
+	return int(be.ActiveSessionsCounter.Load())
 }
 
 func (be *SMTPBackend) CheckMsg(t *testing.T, indx int, from string, rcptTo []string) {
@@ -96,8 +106,26 @@ type session struct {
 	backend  *SMTPBackend
 	user     string
 	password string
-	state    *smtp.ConnectionState
+	conn     *smtp.Conn
 	msg      *SMTPMessage
+}
+
+func (s *session) AuthMechanisms() []string {
+	return []string{sasl.Plain}
+}
+
+func (s *session) Auth(mech string) (sasl.Server, error) {
+	if mech != sasl.Plain {
+		return nil, fmt.Errorf("mechanisms other than plain are unsupported")
+	}
+	return sasl.NewPlainServer(func(identity, username, password string) error {
+		if s.backend.AuthErr != nil {
+			return s.backend.AuthErr
+		}
+		s.user = username
+		s.password = password
+		return nil
+	}), nil
 }
 
 func (s *session) Reset() {
@@ -105,15 +133,7 @@ func (s *session) Reset() {
 }
 
 func (s *session) Logout() error {
-	return nil
-}
-
-func (s *session) AuthPlain(username, password string) error {
-	if s.backend.AuthErr != nil {
-		return s.backend.AuthErr
-	}
-	s.user = username
-	s.password = password
+	s.backend.ActiveSessionsCounter.Add(-1)
 	return nil
 }
 
@@ -130,7 +150,7 @@ func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	return nil
 }
 
-func (s *session) Rcpt(to string) error {
+func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	if err := s.backend.RcptErr[to]; err != nil {
 		return err
 	}
@@ -144,12 +164,12 @@ func (s *session) Data(r io.Reader) error {
 		return s.backend.DataErr
 	}
 
-	b, err := ioutil.ReadAll(r)
+	b, err := io.ReadAll(r)
 	if err != nil {
 		return err
 	}
 	s.msg.Data = b
-	s.msg.State = s.state
+	s.msg.Conn = s.conn
 	s.msg.AuthUser = s.user
 	s.msg.AuthPass = s.password
 	s.backend.Messages = append(s.backend.Messages, s.msg)
@@ -161,12 +181,12 @@ func (s *session) LMTPData(r io.Reader, status smtp.StatusCollector) error {
 		return s.backend.DataErr
 	}
 
-	b, err := ioutil.ReadAll(r)
+	b, err := io.ReadAll(r)
 	if err != nil {
 		return err
 	}
 	s.msg.Data = b
-	s.msg.State = s.state
+	s.msg.Conn = s.conn
 	s.msg.AuthUser = s.user
 	s.msg.AuthPass = s.password
 	s.backend.Messages = append(s.backend.Messages, s.msg)
@@ -179,10 +199,6 @@ func (s *session) LMTPData(r io.Reader, status smtp.StatusCollector) error {
 }
 
 type SMTPServerConfigureFunc func(*smtp.Server)
-
-var AuthDisabled = func(s *smtp.Server) {
-	s.AuthDisabled = true
-}
 
 func SMTPServer(t *testing.T, addr string, fn ...SMTPServerConfigureFunc) (*SMTPBackend, *smtp.Server) {
 	t.Helper()
@@ -212,10 +228,8 @@ func SMTPServer(t *testing.T, addr string, fn ...SMTPServerConfigureFunc) (*SMTP
 	// nil Server.listener (Serve sets it to a non-nil value, so it is racy and
 	// happens only sometimes).
 	testConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	testConn.Close()
+	require.NoError(t, err)
+	require.NoError(t, testConn.Close())
 
 	return be, s
 }
@@ -306,10 +320,8 @@ func SMTPServerSTARTTLS(t *testing.T, addr string, fn ...SMTPServerConfigureFunc
 	// nil Server.listener (Serve sets it to a non-nil value, so it is racy and
 	// happens only sometimes).
 	testConn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	testConn.Close()
+	require.NoError(t, err)
+	require.NoError(t, testConn.Close())
 
 	return clientCfg, be, s
 }
@@ -364,22 +376,28 @@ func SMTPServerTLS(t *testing.T, addr string, fn ...SMTPServerConfigureFunc) (*t
 	if err != nil {
 		t.Fatal(err)
 	}
-	testConn.Close()
+	require.NoError(t, testConn.Close())
 
 	return clientCfg, be, s
+}
+
+type smtpBackendConnCounter interface {
+	ConnectionCount() int
 }
 
 func CheckSMTPConnLeak(t *testing.T, srv *smtp.Server) {
 	t.Helper()
 
+	ccb, ok := srv.Backend.(smtpBackendConnCounter)
+	if !ok {
+		t.Error("CheckSMTPConnLeak used for smtp.Server with backend without ConnectionCount method")
+		return
+	}
+
 	// Connection closure is handled asynchronously, so before failing
 	// wait a bit for handleQuit in go-smtp to do its work.
 	for i := 0; i < 10; i++ {
-		found := false
-		srv.ForEachConn(func(_ *smtp.Conn) {
-			found = true
-		})
-		if !found {
+		if ccb.ConnectionCount() == 0 {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)

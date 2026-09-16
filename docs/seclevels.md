@@ -1,4 +1,4 @@
-# Security levels
+# Outbound delivery security
 
 maddy implements a number of schemes and protocols for discovery and
 enforcement of security features supported by the recipient MTA.
@@ -45,7 +45,7 @@ maddy defines two values indicating how "secure" delivery of message will be:
 - TLS security level
 
 These values correspond to the problems described above. On delivery, the
-estabilished connection to the remote server is "ranked" using these values and
+established connection to the remote server is "ranked" using these values and
 then they are compared against a number of policies (including local
 configuration). If the effective value is lower than the required one, the
 connection is closed and next candidate server is used. If all connections fail
@@ -67,14 +67,14 @@ attacks
 - MX level: None. MX candidate was returned as a result of DNS lookup for the
   recipient domain, no additional checks done.
 - MX level: MTA-STS. Used MX matches the MTA-STS policy published by the
-  recepient domain (even one in testing mode).
+  recipient domain (even one in testing mode).
 - MX level: DNSSEC. MX record is signed.
 
-- TLS level: None. Plaintext connection was estabilished, TLS is not available
+- TLS level: None. Plaintext connection was established, TLS is not available
   or failed.
-- TLS level: Encrypted. TLS connection was estabilished, the server certificate
+- TLS level: Encrypted. TLS connection was established, the server certificate
   failed X.509 and DANE verification.
-- TLS level: Authenticated. TLS connection was estabilished, the server
+- TLS level: Authenticated. TLS connection was established, the server
   certificate passes X.509 **or** DANE verification.
 
 **Note 1:** Persistent attacker able to control network connection can
@@ -83,8 +83,7 @@ passive attacks.
 
 ## maddy security policies
 
-See [**maddy-targets(5)**](../man/\_generated\_maddy-targets.5) page for
-description of configuration options available for each policy mechanism
+See [Remote MX delivery](/reference/targets/remote/) for description of configuration options available for each policy mechanism
 supported by maddy.
 
 [RFC 8461 Section 10.2]: https://www.rfc-editor.org/rfc/rfc8461.html#section-10.2 (SMTP MTA Strict Transport Security - 10.2. Preventing Policy Discovery)

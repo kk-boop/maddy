@@ -29,7 +29,6 @@ package smtp_downstream
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"net"
 	"runtime/trace"
@@ -40,32 +39,32 @@ import (
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
 	tls2 "github.com/foxcpp/maddy/framework/config/tls"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/smtpconn"
 	"github.com/foxcpp/maddy/internal/target"
 	"golang.org/x/net/idna"
 )
 
 type Downstream struct {
-	modName    string
-	instName   string
-	lmtp       bool
-	targetsArg []string
+	modName  string
+	instName string
+	lmtp     bool
 
-	requireTLS      bool
-	attemptStartTLS bool
-	hostname        string
-	endpoints       []config.Endpoint
-	saslFactory     saslClientFactory
-	tlsConfig       tls.Config
+	starttls    bool
+	hostname    string
+	endpoints   []config.Endpoint
+	saslFactory saslClientFactory
+	tlsConfig   *tls.Config
 
 	connectTimeout    time.Duration
 	commandTimeout    time.Duration
 	submissionTimeout time.Duration
 
-	log log.Logger
+	log *log.Logger
 }
 
 func (u *Downstream) moduleError(err error) error {
@@ -78,28 +77,51 @@ func (u *Downstream) moduleError(err error) error {
 	})
 }
 
-func NewDownstream(modName, instName string, _, inlineArgs []string) (module.Module, error) {
+func New(c *container.C, modName, instName string) (module.Module, error) {
 	return &Downstream{
-		modName:    modName,
-		instName:   instName,
-		lmtp:       modName == "target.lmtp" || modName == "lmtp_downstream", /* compatibility with 0.3 configs */
-		targetsArg: inlineArgs,
-		log:        log.Logger{Name: modName},
+		modName:  modName,
+		instName: instName,
+		lmtp:     modName == "target.lmtp",
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
-func (u *Downstream) Init(cfg *config.Map) error {
-	var targetsArg []string
+func (u *Downstream) Configure(inlineArgs []string, cfg *config.Map) error {
+	var attemptTLS *bool
+
+	targetsArg := make([]string, 0, len(inlineArgs))
 	cfg.Bool("debug", true, false, &u.log.Debug)
-	cfg.Bool("require_tls", false, false, &u.requireTLS)
-	cfg.Bool("attempt_starttls", false, !u.lmtp, &u.attemptStartTLS)
+	cfg.Callback("require_tls", func(m *config.Map, node config.Node) error {
+		u.log.Msg("require_tls directive is deprecated and ignored")
+		return nil
+	})
+	cfg.Callback("attempt_starttls", func(m *config.Map, node config.Node) error {
+		u.log.Msg("attempt_starttls directive is deprecated and equivalent to starttls")
+
+		if len(node.Args) == 0 {
+			trueVal := true
+			attemptTLS = &trueVal
+			return nil
+		}
+		if len(node.Args) != 1 {
+			return config.NodeErr(node, "expected exactly 1 argument")
+		}
+
+		b, err := config.ParseBool(node.Args[0])
+		if err != nil {
+			return err
+		}
+		attemptTLS = &b
+		return nil
+	})
+	cfg.Bool("starttls", false, !u.lmtp, &u.starttls)
 	cfg.String("hostname", true, true, "", &u.hostname)
 	cfg.StringList("targets", false, false, nil, &targetsArg)
 	cfg.Custom("auth", false, false, func() (interface{}, error) {
 		return nil, nil
 	}, saslAuthDirective, &u.saslFactory)
 	cfg.Custom("tls_client", true, false, func() (interface{}, error) {
-		return tls.Config{}, nil
+		return &tls.Config{}, nil
 	}, tls2.TLSClientBlock, &u.tlsConfig)
 	cfg.Duration("connect_timeout", false, false, 5*time.Minute, &u.connectTimeout)
 	cfg.Duration("command_timeout", false, false, 5*time.Minute, &u.commandTimeout)
@@ -109,6 +131,10 @@ func (u *Downstream) Init(cfg *config.Map) error {
 		return err
 	}
 
+	if attemptTLS != nil {
+		u.starttls = *attemptTLS
+	}
+
 	// INTERNATIONALIZATION: See RFC 6531 Section 3.7.1.
 	var err error
 	u.hostname, err = idna.ToASCII(u.hostname)
@@ -116,8 +142,8 @@ func (u *Downstream) Init(cfg *config.Map) error {
 		return fmt.Errorf("%s: cannot represent the hostname as an A-label name: %w", u.modName, err)
 	}
 
-	u.targetsArg = append(u.targetsArg, targetsArg...)
-	for _, tgt := range u.targetsArg {
+	targetsArg = append(targetsArg, inlineArgs...)
+	for _, tgt := range targetsArg {
 		endp, err := config.ParseEndpoint(tgt)
 		if err != nil {
 			return err
@@ -143,7 +169,7 @@ func (u *Downstream) InstanceName() string {
 
 type delivery struct {
 	u   *Downstream
-	log log.Logger
+	log *log.Logger
 
 	msgMeta  *module.MsgMetadata
 	mailFrom string
@@ -157,8 +183,8 @@ type lmtpDelivery struct {
 	*delivery
 }
 
-func (u *Downstream) Start(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
-	defer trace.StartRegion(ctx, "target.smtp/Start").End()
+func (u *Downstream) StartDelivery(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
+	defer trace.StartRegion(ctx, "target.smtp/StartDelivery").End()
 
 	d := &delivery{
 		u:        u,
@@ -171,7 +197,9 @@ func (u *Downstream) Start(ctx context.Context, msgMeta *module.MsgMetadata, mai
 	}
 
 	if err := d.conn.Mail(ctx, mailFrom, msgMeta.SMTPOpts); err != nil {
-		d.conn.Close()
+		if err := d.conn.Close(); err != nil {
+			u.log.Error("failed to close smtp connection", err)
+		}
 		return nil, err
 	}
 
@@ -182,6 +210,12 @@ func (u *Downstream) Start(ctx context.Context, msgMeta *module.MsgMetadata, mai
 	return d, nil
 }
 
+func (d *delivery) closeConn(c *smtpconn.C) {
+	if err := c.Close(); err != nil {
+		d.log.Error("failed to close SMTP connection", err)
+	}
+}
+
 func (d *delivery) connect(ctx context.Context) error {
 	// TODO: Review possibility of connection pooling here.
 	var lastErr error
@@ -190,6 +224,7 @@ func (d *delivery) connect(ctx context.Context) error {
 	conn.Log = d.log
 	conn.Hostname = d.u.hostname
 	conn.AddrInSMTPMsg = false
+	conn.DNSErrorsTemporary = true
 	if d.u.connectTimeout != 0 {
 		conn.ConnectTimeout = d.u.connectTimeout
 	}
@@ -201,14 +236,11 @@ func (d *delivery) connect(ctx context.Context) error {
 	}
 
 	for _, endp := range d.u.endpoints {
-		var (
-			didTLS bool
-			err    error
-		)
+		var err error
 		if d.u.lmtp {
-			didTLS, err = conn.ConnectLMTP(ctx, endp, d.u.attemptStartTLS, &d.u.tlsConfig)
+			_, err = conn.ConnectLMTP(ctx, endp, d.u.starttls, d.u.tlsConfig)
 		} else {
-			didTLS, err = conn.Connect(ctx, endp, d.u.attemptStartTLS, &d.u.tlsConfig)
+			_, err = conn.Connect(ctx, endp, d.u.starttls, d.u.tlsConfig)
 		}
 		if err != nil {
 			if len(d.u.endpoints) != 1 {
@@ -220,12 +252,6 @@ func (d *delivery) connect(ctx context.Context) error {
 
 		d.log.DebugMsg("connected", "downstream_server", conn.ServerName())
 
-		if !didTLS && d.u.requireTLS {
-			conn.Close()
-			lastErr = errors.New("TLS is required, but unsupported by downstream")
-			continue
-		}
-
 		lastErr = nil
 		break
 	}
@@ -236,12 +262,12 @@ func (d *delivery) connect(ctx context.Context) error {
 	if d.u.saslFactory != nil {
 		saslClient, err := d.u.saslFactory(d.msgMeta)
 		if err != nil {
-			conn.Close()
+			d.closeConn(conn)
 			return err
 		}
 
 		if err := conn.Client().Auth(saslClient); err != nil {
-			conn.Close()
+			d.closeConn(conn)
 			return err
 		}
 	}
@@ -251,8 +277,8 @@ func (d *delivery) connect(ctx context.Context) error {
 	return nil
 }
 
-func (d *delivery) AddRcpt(ctx context.Context, rcptTo string) error {
-	err := d.conn.Rcpt(ctx, rcptTo)
+func (d *delivery) AddRcpt(ctx context.Context, rcptTo string, opts smtp.RcptOptions) error {
+	err := d.conn.Rcpt(ctx, rcptTo, opts)
 	if err != nil {
 		return d.u.moduleError(err)
 	}
@@ -267,7 +293,11 @@ func (d *delivery) Body(ctx context.Context, header textproto.Header, body buffe
 		return exterrors.WithFields(err, map[string]interface{}{"target": d.u.modName})
 	}
 
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			d.log.Msg("failed to close body buffer", err)
+		}
+	}()
 	return d.u.moduleError(d.conn.Data(ctx, header, r))
 }
 
@@ -279,7 +309,11 @@ func (d *lmtpDelivery) BodyNonAtomic(ctx context.Context, sc module.StatusCollec
 			sc.SetStatus(rcpt, modErr)
 		}
 	}
-	defer r.Close()
+	defer func() {
+		if err := r.Close(); err != nil {
+			d.log.Msg("failed to close body buffer", err)
+		}
+	}()
 
 	rcptIndx := 0
 	err = d.conn.LMTPData(ctx, header, r, func(rcpt string, err *smtp.SMTPError) {
@@ -305,8 +339,7 @@ func (d *lmtpDelivery) BodyNonAtomic(ctx context.Context, sc module.StatusCollec
 }
 
 func (d *delivery) Abort(ctx context.Context) error {
-	d.conn.Close()
-	return nil
+	return d.conn.Close()
 }
 
 func (d *delivery) Commit(ctx context.Context) error {
@@ -314,6 +347,6 @@ func (d *delivery) Commit(ctx context.Context) error {
 }
 
 func init() {
-	module.Register("target.smtp", NewDownstream)
-	module.Register("target.lmtp", NewDownstream)
+	modules.Register("target.smtp", New)
+	modules.Register("target.lmtp", New)
 }

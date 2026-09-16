@@ -11,6 +11,7 @@ import (
 
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/miekg/dns"
+	"github.com/stretchr/testify/require"
 )
 
 type TestSrvAction int
@@ -55,8 +56,8 @@ func (s *IPAddrTestServer) Run() {
 	go s.udpServ.ActivateAndServe() //nolint:errcheck
 }
 
-func (s *IPAddrTestServer) Close() {
-	s.udpServ.PacketConn.Close()
+func (s *IPAddrTestServer) Close() error {
+	return s.udpServ.PacketConn.Close()
 }
 
 func (s *IPAddrTestServer) Addr() *net.UDPAddr {
@@ -128,7 +129,11 @@ func TestExtResolver_AuthLookupIPAddr(t *testing.T) {
 	// AD flag handling for use in DANE algorithms.
 
 	// Silence log messages about disregarded I/O errors.
-	log.DefaultLogger.Out = nil
+	oldLog := log.DefaultLogger
+	log.DefaultLogger = log.NopLogger
+	t.Cleanup(func() {
+		log.DefaultLogger = oldLog
+	})
 
 	test := func(aAct, aaaaAct TestSrvAction, aAD, aaaaAD, ad bool, addrs []net.IP, err bool) {
 		t.Helper()
@@ -141,7 +146,9 @@ func TestExtResolver_AuthLookupIPAddr(t *testing.T) {
 			s.aAD = aAD
 			s.aaaaAD = aaaaAD
 			s.Run()
-			defer s.Close()
+			defer func() {
+				require.NoError(t, s.Close())
+			}()
 			res := ExtResolver{
 				cl: new(dns.Client),
 				Cfg: &dns.ClientConfig{

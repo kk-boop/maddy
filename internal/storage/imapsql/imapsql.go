@@ -28,6 +28,7 @@ package imapsql
 import (
 	"context"
 	"crypto/sha1"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -39,34 +40,43 @@ import (
 	"github.com/emersion/go-imap"
 	sortthread "github.com/emersion/go-imap-sortthread"
 	"github.com/emersion/go-imap/backend"
+	mess "github.com/foxcpp/go-imap-mess"
 	imapsql "github.com/foxcpp/go-imap-sql"
 	"github.com/foxcpp/maddy/framework/config"
 	modconfig "github.com/foxcpp/maddy/framework/config/module"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/dns"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/authz"
+	sqliteprovider "github.com/foxcpp/maddy/internal/sqlite"
 	"github.com/foxcpp/maddy/internal/updatepipe"
+	"github.com/foxcpp/maddy/internal/updatepipe/pubsub"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 )
 
+const modName = "storage.imapsql"
+
 type Storage struct {
 	Back     *imapsql.Backend
 	instName string
-	Log      log.Logger
+	log      *log.Logger
 
 	junkMbox string
 
-	driver string
-	dsn    []string
+	driver    string
+	dsn       []string
+	blobStore module.BlobStore
+	opts      *imapsql.Opts
 
 	resolver dns.Resolver
 
-	updates     <-chan backend.Update
-	updPipe     updatepipe.P
-	updPushStop chan struct{}
+	updPipe      updatepipe.P
+	updPushStop  chan struct{}
+	outboundUpds chan mess.Update
 
 	filters module.IMAPFilter
 
@@ -77,35 +87,36 @@ type Storage struct {
 }
 
 func (store *Storage) Name() string {
-	return "imapsql"
+	return modName
 }
 
 func (store *Storage) InstanceName() string {
 	return store.instName
 }
 
-func New(_, instName string, _, inlineArgs []string) (module.Module, error) {
+func New(c *container.C, modName, instName string) (module.Module, error) {
 	store := &Storage{
 		instName: instName,
-		Log:      log.Logger{Name: "imapsql"},
+		log:      c.DefaultLogger.Sublogger(modName),
 		resolver: dns.DefaultResolver(),
 	}
+	return store, nil
+}
+
+func (store *Storage) Configure(inlineArgs []string, cfg *config.Map) error {
 	if len(inlineArgs) != 0 {
 		if len(inlineArgs) == 1 {
-			return nil, errors.New("imapsql: expected at least 2 arguments")
+			return errors.New("imapsql: expected at least 2 arguments")
 		}
 
 		store.driver = inlineArgs[0]
 		store.dsn = inlineArgs[1:]
 	}
-	return store, nil
-}
 
-func (store *Storage) Init(cfg *config.Map) error {
 	var (
 		driver            string
 		dsn               []string
-		appendlimitVal    = -1
+		appendlimitVal    int64 = -1
 		compression       []string
 		authNormalize     string
 		deliveryNormalize string
@@ -113,15 +124,11 @@ func (store *Storage) Init(cfg *config.Map) error {
 		blobStore module.BlobStore
 	)
 
-	opts := imapsql.Opts{
-		// Prevent deadlock if nobody is listening for updates (e.g. no IMAP
-		// configured).
-		LazyUpdatesInit: true,
-	}
+	opts := &imapsql.Opts{}
 	cfg.String("driver", false, false, store.driver, &driver)
 	cfg.StringList("dsn", false, false, store.dsn, &dsn)
 	cfg.Callback("fsstore", func(m *config.Map, node config.Node) error {
-		store.Log.Msg("'fsstore' directive is deprecated, use 'msg_store fs' instead")
+		store.log.Msg("'fsstore' directive is deprecated, use 'msg_store fs' instead")
 		return modconfig.ModuleFromNode("storage.blob", append([]string{"fs"}, node.Args...),
 			node, m.Globals, &blobStore)
 	})
@@ -138,10 +145,10 @@ func (store *Storage) Init(cfg *config.Map) error {
 	}, &blobStore)
 	cfg.StringList("compression", false, false, []string{"off"}, &compression)
 	cfg.DataSize("appendlimit", false, false, 32*1024*1024, &appendlimitVal)
-	cfg.Bool("debug", true, false, &store.Log.Debug)
+	cfg.Bool("debug", true, false, &store.log.Debug)
 	cfg.Int("sqlite3_cache_size", false, false, 0, &opts.CacheSize)
 	cfg.Int("sqlite3_busy_timeout", false, false, 5000, &opts.BusyTimeout)
-	cfg.Bool("sqlite3_exclusive_lock", false, false, &opts.ExclusiveLock)
+	cfg.Bool("disable_recent", false, true, &opts.DisableRecent)
 	cfg.String("junk_mailbox", false, false, "Junk", &store.junkMbox)
 	cfg.Custom("imap_filter", false, false, func() (interface{}, error) {
 		return nil, nil
@@ -153,7 +160,7 @@ func (store *Storage) Init(cfg *config.Map) error {
 	cfg.Custom("auth_map", false, false, func() (interface{}, error) {
 		return nil, nil
 	}, modconfig.TableDirective, &store.authMap)
-	cfg.String("auth_normalize", false, false, "precis_casefold_email", &authNormalize)
+	cfg.String("auth_normalize", false, false, "auto", &authNormalize)
 	cfg.Custom("delivery_map", false, false, func() (interface{}, error) {
 		return nil, nil
 	}, modconfig.TableDirective, &store.deliveryMap)
@@ -169,6 +176,17 @@ func (store *Storage) Init(cfg *config.Map) error {
 	if driver == "" {
 		return errors.New("imapsql: driver is required")
 	}
+
+	if sqliteprovider.IsSqliteDriver(driver) {
+		if sqliteprovider.IsTranspiled {
+			store.log.Println("using transpiled SQLite (modernc.org/sqlite)")
+		} else if sqliteprovider.IsAvailable {
+			store.log.Debugln("using cgo SQLite")
+		} else {
+			return errors.New("imapsql: SQLite is not supported, recompile without no_sqlite3 tag set")
+		}
+	}
+	driver = sqliteprovider.MapDriverName(driver)
 
 	deliveryNormFunc, ok := authz.NormalizeFuncs[deliveryNormalize]
 	if !ok {
@@ -191,6 +209,9 @@ func (store *Storage) Init(cfg *config.Map) error {
 		}
 	}
 
+	if authNormalize != "auto" {
+		store.log.Msg("auth_normalize in storage.imapsql is deprecated and will be removed in the next release, use storage_map in imap config instead")
+	}
 	authNormFunc, ok := authz.NormalizeFuncs[authNormalize]
 	if !ok {
 		return errors.New("imapsql: unknown normalization function: " + authNormalize)
@@ -199,6 +220,7 @@ func (store *Storage) Init(cfg *config.Map) error {
 		return authNormFunc(s)
 	}
 	if store.authMap != nil {
+		store.log.Msg("auth_map in storage.imapsql is deprecated and will be removed in the next release, use storage_map in imap config instead")
 		store.authNormalize = func(ctx context.Context, username string) (string, error) {
 			username, err := authNormFunc(username)
 			if err != nil {
@@ -212,22 +234,19 @@ func (store *Storage) Init(cfg *config.Map) error {
 		}
 	}
 
-	opts.Log = &store.Log
+	opts.Log = store.log
 
 	if appendlimitVal == -1 {
 		opts.MaxMsgBytes = nil
 	} else {
 		// int is 32-bit on some platforms, so cut off values we can't actually
 		// use.
-		if int(uint32(appendlimitVal)) != appendlimitVal {
+		if int64(uint32(appendlimitVal)) != appendlimitVal {
 			return errors.New("imapsql: appendlimit value is too big")
 		}
 		opts.MaxMsgBytes = new(uint32)
 		*opts.MaxMsgBytes = uint32(appendlimitVal)
 	}
-	var err error
-
-	dsnStr := strings.Join(dsn, " ")
 
 	if len(compression) != 0 {
 		switch compression[0] {
@@ -251,19 +270,33 @@ func (store *Storage) Init(cfg *config.Map) error {
 		}
 	}
 
-	store.Back, err = imapsql.New(driver, dsnStr, ExtBlobStore{Base: blobStore}, opts)
-	if err != nil {
-		return fmt.Errorf("imapsql: %s", err)
+	driverFound := false
+	for _, d := range sql.Drivers() {
+		if d == driver {
+			driverFound = true
+			break
+		}
 	}
-
-	store.Log.Debugln("go-imap-sql version", imapsql.VersionStr)
+	if !driverFound {
+		return fmt.Errorf("imapsql: unknown driver %q", driver)
+	}
 
 	store.driver = driver
 	store.dsn = dsn
+	store.blobStore = blobStore
+	store.opts = opts
+	store.log.Debugln("go-imap-sql version", imapsql.VersionStr)
 
-	store.Back.EnableChildrenExt()
-	store.Back.EnableSpecialUseExt()
+	return nil
+}
 
+func (store *Storage) Start() error {
+	dsnStr := strings.Join(store.dsn, " ")
+	var err error
+	store.Back, err = imapsql.New(store.driver, dsnStr, ExtBlobStore{Base: store.blobStore}, *store.opts)
+	if err != nil {
+		return fmt.Errorf("imapsql: %s", err)
+	}
 	return nil
 }
 
@@ -271,29 +304,42 @@ func (store *Storage) EnableUpdatePipe(mode updatepipe.BackendMode) error {
 	if store.updPipe != nil {
 		return nil
 	}
-	if store.updates != nil {
-		panic("imapsql: EnableUpdatePipe called after Updates")
-	}
-
-	upds := store.Back.Updates()
 
 	switch store.driver {
-	case "sqlite3":
+	case "sqlite3", "sqlite":
 		dbId := sha1.Sum([]byte(strings.Join(store.dsn, " ")))
+		sockPath := filepath.Join(
+			config.RuntimeDirectory,
+			fmt.Sprintf("sql-%s.sock", hex.EncodeToString(dbId[:])))
+		store.log.DebugMsg("using unix socket for external updates", "path", sockPath)
 		store.updPipe = &updatepipe.UnixSockPipe{
-			SockPath: filepath.Join(
-				config.RuntimeDirectory,
-				fmt.Sprintf("sql-%s.sock", hex.EncodeToString(dbId[:]))),
-			Log: log.Logger{Name: "sql/updpipe", Debug: store.Log.Debug},
+			SockPath: sockPath,
+			Log:      store.log.Sublogger("updpipe"),
 		}
+	case "postgres":
+		store.log.DebugMsg("using PostgreSQL broker for external updates")
+		ps, err := pubsub.NewPQ(strings.Join(store.dsn, " "))
+		if err != nil {
+			return fmt.Errorf("enable_update_pipe: %w", err)
+		}
+		ps.Log = store.log.Sublogger("updpipe/pubsub")
+		pipe := &updatepipe.PubSubPipe{
+			PubSub: ps,
+			Log:    store.log.Sublogger("updpipe"),
+		}
+		store.Back.UpdateManager().ExternalUnsubscribe = pipe.Unsubscribe
+		store.Back.UpdateManager().ExternalSubscribe = pipe.Subscribe
+		store.updPipe = pipe
 	default:
 		return errors.New("imapsql: driver does not have an update pipe implementation")
 	}
 
-	wrapped := make(chan backend.Update, cap(upds)*2)
+	inbound := make(chan mess.Update, 32)
+	outbound := make(chan mess.Update, 10)
+	store.outboundUpds = outbound
 
 	if mode == updatepipe.ModeReplicate {
-		if err := store.updPipe.Listen(wrapped); err != nil {
+		if err := store.updPipe.Listen(inbound); err != nil {
 			store.updPipe = nil
 			return err
 		}
@@ -304,11 +350,18 @@ func (store *Storage) EnableUpdatePipe(mode updatepipe.BackendMode) error {
 		return err
 	}
 
-	store.updPushStop = make(chan struct{})
+	store.Back.UpdateManager().SetExternalSink(outbound)
+
+	store.updPushStop = make(chan struct{}, 1)
 	go func() {
 		defer func() {
+			// Ensure we sent all outbound updates.
+			for upd := range outbound {
+				if err := store.updPipe.Push(upd); err != nil {
+					store.log.Error("IMAP update pipe push failed", err)
+				}
+			}
 			store.updPushStop <- struct{}{}
-			close(wrapped)
 
 			if err := recover(); err != nil {
 				stack := debug.Stack()
@@ -318,27 +371,21 @@ func (store *Storage) EnableUpdatePipe(mode updatepipe.BackendMode) error {
 
 		for {
 			select {
-			case <-store.updPushStop:
-				return
-			case u := <-upds:
-				if u == nil {
-					// The channel is closed. We must be stopping now.
-					<-store.updPushStop
+			case u := <-inbound:
+				store.log.DebugMsg("external update received", "type", u.Type, "key", u.Key)
+				store.Back.UpdateManager().ExternalUpdate(u)
+			case u, ok := <-outbound:
+				if !ok {
 					return
 				}
-
+				store.log.DebugMsg("sending external update", "type", u.Type, "key", u.Key)
 				if err := store.updPipe.Push(u); err != nil {
-					store.Log.Error("IMAP update pipe push failed", err)
-				}
-
-				if mode != updatepipe.ModePush {
-					wrapped <- u
+					store.log.Error("IMAP update pipe push failed", err)
 				}
 			}
 		}
 	}()
 
-	store.updates = wrapped
 	return nil
 }
 
@@ -352,19 +399,6 @@ func (store *Storage) IMAPExtensions() []string {
 
 func (store *Storage) CreateMessageLimit() *uint32 {
 	return store.Back.CreateMessageLimit()
-}
-
-func (store *Storage) Updates() <-chan backend.Update {
-	if store.updates != nil {
-		return store.updates
-	}
-
-	store.updates = store.Back.Updates()
-	return store.updates
-}
-
-func (store *Storage) EnableChildrenExt() bool {
-	return store.Back.EnableChildrenExt()
 }
 
 func (store *Storage) GetOrCreateIMAPAcct(username string) (backend.User, error) {
@@ -390,24 +424,28 @@ func (store *Storage) Lookup(ctx context.Context, key string) (string, bool, err
 		return "", false, err
 	}
 	if err := usr.Logout(); err != nil {
-		store.Log.Error("logout failed", err, "username", accountName)
+		store.log.Error("logout failed", err, "username", accountName)
 	}
 
 	return "", true, nil
 }
 
-func (store *Storage) Close() error {
+func (store *Storage) Stop() error {
 	// Stop backend from generating new updates.
-	store.Back.Close()
+	if err := store.Back.Close(); err != nil {
+		store.log.Error("close backend failed", err)
+	}
 
 	// Wait for 'updates replicate' goroutine to actually stop so we will send
-	// all updates before shuting down (this is especially important for
-	// maddyctl).
+	// all updates before shutting down (this is especially important for
+	// maddy subcommands).
 	if store.updPipe != nil {
-		store.updPushStop <- struct{}{}
+		close(store.outboundUpds)
 		<-store.updPushStop
 
-		store.updPipe.Close()
+		if err := store.updPipe.Close(); err != nil {
+			store.log.Error("updatepipe close failed", err)
+		}
 	}
 
 	return nil
@@ -422,6 +460,6 @@ func (store *Storage) SupportedThreadAlgorithms() []sortthread.ThreadAlgorithm {
 }
 
 func init() {
-	module.Register("storage.imapsql", New)
-	module.Register("target.imapsql", New)
+	modules.Register("storage.imapsql", New)
+	modules.Register("target.imapsql", New)
 }

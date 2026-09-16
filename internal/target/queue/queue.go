@@ -30,12 +30,12 @@ All scheduled deliveries are attempted to the configured DeliveryTarget.
 All metadata is preserved on disk.
 
 Failure status is determined on per-recipient basis:
-- Delivery.Start fail handled as a failure for all recipients.
-- Delivery.AddRcpt fail handled as a failure for the corresponding recipient.
-- Delivery.Body fail handled as a failure for all recipients.
-- If Delivery implements PartialDelivery, then
-  PartialDelivery.BodyNonAtomic is used instead. Failures are determined based
-  on StatusCollector.SetStatus calls done by target in this case.
+  - Delivery.StartDelivery fail handled as a failure for all recipients.
+  - Delivery.AddRcpt fail handled as a failure for the corresponding recipient.
+  - Delivery.Body fail handled as a failure for all recipients.
+  - If Delivery implements PartialDelivery, then
+    PartialDelivery.BodyNonAtomic is used instead. Failures are determined based
+    on StatusCollector.SetStatus calls done by target in this case.
 
 For each failure check is done to see if it is a permanent failure
 or a temporary one. This is done using exterrors.IsTemporaryOrUnspec.
@@ -63,7 +63,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
@@ -80,9 +79,11 @@ import (
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
 	modconfig "github.com/foxcpp/maddy/framework/config/module"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/dsn"
 	"github.com/foxcpp/maddy/internal/msgpipeline"
 	"github.com/foxcpp/maddy/internal/target"
@@ -90,7 +91,6 @@ import (
 
 // partialError describes state of partially successful message delivery.
 type partialError struct {
-
 	// Underlying error objects for each recipient.
 	Errs map[string]error
 
@@ -111,7 +111,7 @@ func (pe *partialError) SetStatus(rcptTo string, err error) {
 	pe.Errs[rcptTo] = err
 }
 
-func (pe partialError) Error() string {
+func (pe *partialError) Error() string {
 	return fmt.Sprintf("delivery failed for some recipients: %v", pe.Errs)
 }
 
@@ -124,16 +124,16 @@ type Queue struct {
 	location         string
 	hostname         string
 	autogenMsgDomain string
-	wheel            *TimeWheel
+	wheel            *TimeWheel[queueSlot]
 
 	dsnPipeline module.DeliveryTarget
 
 	// Retry delay is calculated using the following formula:
 	// initialRetryTime * retryTimeScale ^ (TriesCount - 1)
-
 	initialRetryTime time.Duration
 	retryTimeScale   float64
 	maxTries         int
+	maxParallelism   int
 
 	// If any delivery is scheduled in less than postInitDelay
 	// after Init, its delay will be increased by postInitDelay.
@@ -147,7 +147,7 @@ type Queue struct {
 	// after start-up for whatever reason it will not affect the queue.
 	postInitDelay time.Duration
 
-	Log    log.Logger
+	log    *log.Logger
 	Target module.DeliveryTarget
 
 	deliveryWg sync.WaitGroup
@@ -189,30 +189,33 @@ type queueSlot struct {
 	Body buffer.Buffer
 }
 
-func NewQueue(_, instName string, _, inlineArgs []string) (module.Module, error) {
+func New(c *container.C, modName, instName string) (module.Module, error) {
 	q := &Queue{
 		name:             instName,
 		initialRetryTime: 15 * time.Minute,
 		retryTimeScale:   1.25,
 		postInitDelay:    10 * time.Second,
-		Log:              log.Logger{Name: "queue"},
+		log:              c.DefaultLogger.Sublogger(modName),
 	}
+	return q, nil
+}
+
+func (q *Queue) Configure(inlineArgs []string, cfg *config.Map) error {
 	switch len(inlineArgs) {
 	case 0:
 		// Not inline definition.
 	case 1:
 		q.location = inlineArgs[0]
 	default:
-		return nil, errors.New("queue: wrong amount of inline arguments")
+		return errors.New("queue: wrong amount of inline arguments")
 	}
-	return q, nil
-}
 
-func (q *Queue) Init(cfg *config.Map) error {
-	var maxParallelism int
-	cfg.Bool("debug", true, false, &q.Log.Debug)
+	cfg.Bool("debug", true, false, &q.log.Debug)
 	cfg.Int("max_tries", false, false, 20, &q.maxTries)
-	cfg.Int("max_parallelism", false, false, 16, &maxParallelism)
+	cfg.Int("max_parallelism", false, false, 16, &q.maxParallelism)
+	cfg.Duration("post_init_delay", false, false, q.postInitDelay, &q.postInitDelay)
+	cfg.Duration("initial_retry_time", false, false, q.initialRetryTime, &q.initialRetryTime)
+	cfg.Float("retry_time_scale", false, false, q.retryTimeScale, &q.retryTimeScale)
 	cfg.String("location", false, false, q.location, &q.location)
 	cfg.Custom("target", false, true, nil, modconfig.DeliveryDirective, &q.Target)
 	cfg.String("hostname", true, true, "", &q.hostname)
@@ -230,7 +233,7 @@ func (q *Queue) Init(cfg *config.Map) error {
 		}
 
 		q.dsnPipeline.(*msgpipeline.MsgPipeline).Hostname = q.hostname
-		q.dsnPipeline.(*msgpipeline.MsgPipeline).Log = log.Logger{Name: "queue/pipeline", Debug: q.Log.Debug}
+		q.dsnPipeline.(*msgpipeline.MsgPipeline).Log = q.log.Sublogger("pipeline")
 	}
 	if q.location == "" && q.name == "" {
 		return errors.New("queue: need explicit location directive or inline argument if defined inline")
@@ -243,28 +246,36 @@ func (q *Queue) Init(cfg *config.Map) error {
 	if err := os.MkdirAll(q.location, os.ModePerm); err != nil {
 		return err
 	}
+	return nil
+}
 
-	return q.start(maxParallelism)
+func (q *Queue) Start() error {
+	return q.start(q.maxParallelism)
 }
 
 func (q *Queue) start(maxParallelism int) error {
-	q.wheel = NewTimeWheel(q.dispatch)
+	q.wheel = NewTimeWheel[queueSlot](q.dispatch)
 	q.deliverySemaphore = make(chan struct{}, maxParallelism)
 
 	if err := q.readDiskQueue(); err != nil {
 		return err
 	}
 
-	q.Log.Debugf("delivery target: %T", q.Target)
+	q.log.Debugf("delivery target: %T", q.Target)
 
 	return nil
 }
 
-func (q *Queue) Close() error {
+func (q *Queue) EarlyStop() error {
+	// We must ensure queue state is consistent on disk before we proceed
+	// with configuration reload.
 	q.wheel.Close()
 	q.deliveryWg.Wait()
-
 	return nil
+}
+
+func (q *Queue) Stop() error {
+	return q.EarlyStop()
 }
 
 // discardBroken changes the name of metadata file to have .meta_broken
@@ -282,14 +293,14 @@ func (q *Queue) discardBroken(id string) {
 	}
 }
 
-func (q *Queue) dispatch(value TimeSlot) {
-	slot := value.Value.(queueSlot)
+func (q *Queue) dispatch(ctx context.Context, value TimeSlot[queueSlot]) {
+	slot := value.Value
 
-	q.Log.Debugln("starting delivery for", slot.ID)
+	q.log.Debugln("starting delivery for", slot.ID)
 
 	q.deliveryWg.Add(1)
 	go func() {
-		q.Log.Debugln("waiting on delivery semaphore for", slot.ID)
+		q.log.Debugln("waiting on delivery semaphore for", slot.ID)
 		q.deliverySemaphore <- struct{}{}
 		defer func() {
 			<-q.deliverySemaphore
@@ -306,7 +317,7 @@ func (q *Queue) dispatch(value TimeSlot) {
 			}
 		}()
 
-		q.Log.Debugln("delivery semaphore acquired for", slot.ID)
+		q.log.Debugln("delivery semaphore acquired for", slot.ID)
 		var (
 			meta *QueueMetadata
 			hdr  textproto.Header
@@ -316,7 +327,7 @@ func (q *Queue) dispatch(value TimeSlot) {
 			var err error
 			meta, hdr, body, err = q.openMessage(slot.ID)
 			if err != nil {
-				q.Log.Error("read message", err, slot.ID)
+				q.log.Error("read message", err, slot.ID)
 				return
 			}
 			if meta == nil {
@@ -328,7 +339,7 @@ func (q *Queue) dispatch(value TimeSlot) {
 			body = slot.Body
 		}
 
-		q.tryDelivery(meta, hdr, body)
+		q.tryDelivery(ctx, meta, hdr, body)
 	}()
 }
 
@@ -372,10 +383,10 @@ func toSMTPErr(err error) *smtp.SMTPError {
 	return res
 }
 
-func (q *Queue) tryDelivery(meta *QueueMetadata, header textproto.Header, body buffer.Buffer) {
-	dl := target.DeliveryLogger(q.Log, meta.MsgMeta)
+func (q *Queue) tryDelivery(ctx context.Context, meta *QueueMetadata, header textproto.Header, body buffer.Buffer) {
+	dl := target.DeliveryLogger(q.log, meta.MsgMeta)
 
-	partialErr := q.deliver(meta, header, body)
+	partialErr := q.deliver(ctx, meta, header, body)
 	dl.Debugf("errors: %v", partialErr.Errs)
 
 	// While iterating the list of recipients we also pick the smallest tries count
@@ -403,7 +414,7 @@ func (q *Queue) tryDelivery(meta *QueueMetadata, header textproto.Header, body b
 		meta.RcptErrs[rcpt] = toSMTPErr(rcptErr)
 
 		temporary := exterrors.IsTemporaryOrUnspec(rcptErr)
-		if !temporary || meta.TriesCount[rcpt]+1 == q.maxTries {
+		if !temporary || meta.TriesCount[rcpt]+1 >= q.maxTries {
 			delete(meta.TriesCount, rcpt)
 			dl.Msg("not delivered, permanent error", "rcpt", rcpt)
 			failedRcpts = append(failedRcpts, rcpt)
@@ -459,8 +470,8 @@ func (q *Queue) tryDelivery(meta *QueueMetadata, header textproto.Header, body b
 	})
 }
 
-func (q *Queue) deliver(meta *QueueMetadata, header textproto.Header, body buffer.Buffer) partialError {
-	dl := target.DeliveryLogger(q.Log, meta.MsgMeta)
+func (q *Queue) deliver(ctx context.Context, meta *QueueMetadata, header textproto.Header, body buffer.Buffer) partialError {
+	dl := target.DeliveryLogger(q.log, meta.MsgMeta)
 	perr := partialError{
 		Errs:       map[string]error{},
 		statusLock: new(sync.Mutex),
@@ -470,25 +481,34 @@ func (q *Queue) deliver(meta *QueueMetadata, header textproto.Header, body buffe
 	msgMeta.ID = msgMeta.ID + "-" + strconv.FormatInt(time.Now().Unix(), 16)
 	dl.Debugf("using message ID = %s", msgMeta.ID)
 
-	msgCtx, msgTask := trace.NewTask(context.Background(), "Queue delivery")
+	msgCtx, msgTask := trace.NewTask(ctx, "Queue delivery")
 	defer msgTask.End()
 
 	mailCtx, mailTask := trace.NewTask(msgCtx, "MAIL FROM")
-	delivery, err := q.Target.Start(mailCtx, msgMeta, meta.From)
+	delivery, err := q.Target.StartDelivery(mailCtx, msgMeta, meta.From)
 	mailTask.End()
 	if err != nil {
-		dl.Debugf("target.Start failed: %v", err)
+		dl.Debugf("target.StartDelivery failed: %v", err)
 		for _, rcpt := range meta.To {
 			perr.Errs[rcpt] = err
 		}
 		return perr
 	}
-	dl.Debugf("target.Start OK")
+	dl.Debugf("target.StartDelivery OK")
+
+	// Check in case delivery implementation is actually
+	// context-unaware.
+	if err := mailCtx.Err(); err != nil {
+		for _, rcpt := range meta.To {
+			perr.Errs[rcpt] = err
+		}
+		return perr
+	}
 
 	var acceptedRcpts []string
 	for _, rcpt := range meta.To {
 		rcptCtx, rcptTask := trace.NewTask(msgCtx, "RCPT TO")
-		if err := delivery.AddRcpt(rcptCtx, rcpt); err != nil {
+		if err := delivery.AddRcpt(rcptCtx, rcpt, smtp.RcptOptions{} /* TODO: DSN support */); err != nil {
 			dl.Debugf("delivery.AddRcpt %s failed: %v", rcpt, err)
 			perr.Errs[rcpt] = err
 		} else {
@@ -496,10 +516,19 @@ func (q *Queue) deliver(meta *QueueMetadata, header textproto.Header, body buffe
 			acceptedRcpts = append(acceptedRcpts, rcpt)
 		}
 		rcptTask.End()
+
+		// Check in case delivery implementation is actually
+		// context-unaware.
+		if err := mailCtx.Err(); err != nil {
+			for _, rcpt := range meta.To {
+				perr.Errs[rcpt] = err
+			}
+			return perr
+		}
 	}
 
 	if len(acceptedRcpts) == 0 {
-		dl.Debugf("delivery.Abort (no accepted receipients)")
+		dl.Debugf("delivery.Abort (no accepted recipients)")
 		if err := delivery.Abort(msgCtx); err != nil {
 			dl.Error("delivery.Abort failed", err)
 		}
@@ -511,6 +540,10 @@ func (q *Queue) deliver(meta *QueueMetadata, header textproto.Header, body buffe
 			perr.Errs[rcpt] = err
 		}
 	}
+
+	// At this point, it is too late to abort delivery. We should complete
+	// it or fail it consistently.
+	msgCtx = context.WithoutCancel(msgCtx)
 
 	bodyCtx, bodyTask := trace.NewTask(msgCtx, "DATA")
 	defer bodyTask.End()
@@ -559,7 +592,7 @@ type queueDelivery struct {
 	body   buffer.Buffer
 }
 
-func (qd *queueDelivery) AddRcpt(ctx context.Context, rcptTo string) error {
+func (qd *queueDelivery) AddRcpt(ctx context.Context, rcptTo string, _ smtp.RcptOptions) error {
 	qd.meta.To = append(qd.meta.To, rcptTo)
 	return nil
 }
@@ -606,7 +639,7 @@ func (qd *queueDelivery) Commit(ctx context.Context) error {
 	return nil
 }
 
-func (q *Queue) Start(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
+func (q *Queue) StartDelivery(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
 	meta := &QueueMetadata{
 		MsgMeta:      msgMeta,
 		From:         mailFrom,
@@ -619,7 +652,7 @@ func (q *Queue) Start(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom
 
 func (q *Queue) removeFromDisk(msgMeta *module.MsgMetadata) {
 	id := msgMeta.ID
-	dl := target.DeliveryLogger(q.Log, msgMeta)
+	dl := target.DeliveryLogger(q.log, msgMeta)
 
 	// Order is important.
 	// If we remove header and body but can't remove meta now - readDiskQueue
@@ -636,11 +669,14 @@ func (q *Queue) removeFromDisk(msgMeta *module.MsgMetadata) {
 	if err := os.Remove(metaPath); err != nil {
 		dl.Error("failed to remove meta-data from disk", err)
 	}
+
+	queuedMsgs.WithLabelValues(q.name, q.location).Dec()
+
 	dl.Debugf("removed message from disk")
 }
 
 func (q *Queue) readDiskQueue() error {
-	dirInfo, err := ioutil.ReadDir(q.location)
+	dirInfo, err := os.ReadDir(q.location)
 	if err != nil {
 		return err
 	}
@@ -658,18 +694,18 @@ func (q *Queue) readDiskQueue() error {
 
 		meta, err := q.readMessageMeta(id)
 		if err != nil {
-			q.Log.Printf("failed to read meta-data, skipping: %v (msg ID = %s)", err, id)
+			q.log.Printf("failed to read meta-data, skipping: %v (msg ID = %s)", err, id)
 			continue
 		}
 
 		// Check header file existence.
 		if _, err := os.Stat(filepath.Join(q.location, id+".header")); err != nil {
 			if os.IsNotExist(err) {
-				q.Log.Printf("header file doesn't exist for msg ID = %s", id)
+				q.log.Printf("header file doesn't exist for msg ID = %s", id)
 				q.tryRemoveDanglingFile(id + ".meta")
 				q.tryRemoveDanglingFile(id + ".body")
 			} else {
-				q.Log.Printf("skipping nonstat'able header file: %v (msg ID = %s)", err, id)
+				q.log.Printf("skipping nonstat'able header file: %v (msg ID = %s)", err, id)
 			}
 			continue
 		}
@@ -677,11 +713,11 @@ func (q *Queue) readDiskQueue() error {
 		// Check body file existence.
 		if _, err := os.Stat(filepath.Join(q.location, id+".body")); err != nil {
 			if os.IsNotExist(err) {
-				q.Log.Printf("body file doesn't exist for msg ID = %s", id)
+				q.log.Printf("body file doesn't exist for msg ID = %s", id)
 				q.tryRemoveDanglingFile(id + ".meta")
 				q.tryRemoveDanglingFile(id + ".header")
 			} else {
-				q.Log.Printf("skipping nonstat'able body file: %v (msg ID = %s)", err, id)
+				q.log.Printf("skipping nonstat'able body file: %v (msg ID = %s)", err, id)
 			}
 			continue
 		}
@@ -700,15 +736,17 @@ func (q *Queue) readDiskQueue() error {
 			nextTryTime = time.Now().Add(q.postInitDelay)
 		}
 
-		q.Log.Debugf("will try to deliver (msg ID = %s) in %v (%v)", id, time.Until(nextTryTime), nextTryTime)
+		q.log.Debugf("will try to deliver (msg ID = %s) in %v (%v)", id, time.Until(nextTryTime), nextTryTime)
 		q.wheel.Add(nextTryTime, queueSlot{
 			ID: id,
 		})
 		loadedCount++
+
+		queuedMsgs.WithLabelValues(q.name, q.location).Inc()
 	}
 
 	if loadedCount != 0 {
-		q.Log.Printf("loaded %d saved queue entries", loadedCount)
+		q.log.Printf("loaded %d saved queue entries", loadedCount)
 	}
 
 	return nil
@@ -722,7 +760,11 @@ func (q *Queue) storeNewMessage(meta *QueueMetadata, header textproto.Header, bo
 	if err != nil {
 		return nil, err
 	}
-	defer headerFile.Close()
+	defer func() {
+		if err := headerFile.Close(); err != nil {
+			q.log.Error("header file close failed", err)
+		}
+	}()
 
 	if err := textproto.WriteHeader(headerFile, header); err != nil {
 		q.tryRemoveDanglingFile(id + ".header")
@@ -734,14 +776,22 @@ func (q *Queue) storeNewMessage(meta *QueueMetadata, header textproto.Header, bo
 		q.tryRemoveDanglingFile(id + ".header")
 		return nil, err
 	}
-	defer bodyReader.Close()
+	defer func() {
+		if err := bodyReader.Close(); err != nil {
+			q.log.Error("bodyReader close failed", err)
+		}
+	}()
 
 	bodyPath := filepath.Join(q.location, id+".body")
 	bodyFile, err := os.Create(bodyPath)
 	if err != nil {
 		return nil, err
 	}
-	defer bodyFile.Close()
+	defer func() {
+		if err := bodyFile.Close(); err != nil {
+			q.log.Error("body file close failed", err)
+		}
+	}()
 
 	if _, err := io.Copy(bodyFile, bodyReader); err != nil {
 		q.tryRemoveDanglingFile(id + ".body")
@@ -763,6 +813,8 @@ func (q *Queue) storeNewMessage(meta *QueueMetadata, header textproto.Header, bo
 		return nil, err
 	}
 
+	queuedMsgs.WithLabelValues(q.name, q.location).Inc()
+
 	return buffer.FileBuffer{Path: bodyPath, LenHint: body.Len()}, nil
 }
 
@@ -782,7 +834,11 @@ func (q *Queue) updateMetadataOnDisk(meta *QueueMetadata) error {
 			return err
 		}
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			q.log.Error("metadata file close failed", err)
+		}
+	}()
 
 	metaCopy := *meta
 	metaCopy.MsgMeta = meta.MsgMeta.DeepCopy()
@@ -811,7 +867,11 @@ func (q *Queue) readMessageMeta(id string) (*QueueMetadata, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			q.log.Error("metadata file close failed", err)
+		}
+	}()
 
 	meta := &QueueMetadata{}
 
@@ -836,10 +896,10 @@ type BufferedReadCloser struct {
 
 func (q *Queue) tryRemoveDanglingFile(name string) {
 	if err := os.Remove(filepath.Join(q.location, name)); err != nil {
-		q.Log.Error("dangling file remove failed", err)
+		q.log.Error("dangling file remove failed", err)
 		return
 	}
-	q.Log.Printf("removed dangling file %s", name)
+	q.log.Printf("removed dangling file %s", name)
 }
 
 func (q *Queue) openMessage(id string) (*QueueMetadata, textproto.Header, buffer.Buffer, error) {
@@ -898,7 +958,7 @@ func (q *Queue) emitDSN(meta *QueueMetadata, header textproto.Header, failedRcpt
 
 	dsnID, err := module.GenerateMsgID()
 	if err != nil {
-		q.Log.Error("rand.Rand error", err)
+		q.log.Error("rand.Rand error", err)
 		return
 	}
 
@@ -938,7 +998,7 @@ func (q *Queue) emitDSN(meta *QueueMetadata, header textproto.Header, failedRcpt
 	}
 
 	var dsnBodyBlob bytes.Buffer
-	dl := target.DeliveryLogger(q.Log, meta.MsgMeta)
+	dl := target.DeliveryLogger(q.log, meta.MsgMeta)
 	dsnHeader, err := dsn.GenerateDSN(meta.MsgMeta.SMTPOpts.UTF8, dsnEnvelope, mtaInfo, rcptInfo, header, &dsnBodyBlob)
 	if err != nil {
 		dl.Error("failed to generate fail DSN", err)
@@ -959,7 +1019,7 @@ func (q *Queue) emitDSN(meta *QueueMetadata, header textproto.Header, failedRcpt
 	defer msgTask.End()
 
 	mailCtx, mailTask := trace.NewTask(msgCtx, "MAIL FROM")
-	dsnDelivery, err := q.dsnPipeline.Start(mailCtx, dsnMeta, "")
+	dsnDelivery, err := q.dsnPipeline.StartDelivery(mailCtx, dsnMeta, "")
 	mailTask.End()
 	if err != nil {
 		dl.Error("failed to enqueue DSN", err, "dsn_id", dsnID)
@@ -976,7 +1036,7 @@ func (q *Queue) emitDSN(meta *QueueMetadata, header textproto.Header, failedRcpt
 	}()
 
 	rcptCtx, rcptTask := trace.NewTask(msgCtx, "RCPT TO")
-	if err = dsnDelivery.AddRcpt(rcptCtx, meta.From); err != nil {
+	if err = dsnDelivery.AddRcpt(rcptCtx, meta.From, smtp.RcptOptions{}); err != nil {
 		rcptTask.End()
 		return
 	}
@@ -995,5 +1055,5 @@ func (q *Queue) emitDSN(meta *QueueMetadata, header textproto.Header, failedRcpt
 }
 
 func init() {
-	module.Register("target.queue", NewQueue)
+	modules.Register("target.queue", New)
 }

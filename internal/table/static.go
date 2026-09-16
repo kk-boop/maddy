@@ -22,7 +22,9 @@ import (
 	"context"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 type Static struct {
@@ -32,7 +34,7 @@ type Static struct {
 	m map[string][]string
 }
 
-func NewStatic(modName, instName string, _, _ []string) (module.Module, error) {
+func NewStatic(_ *container.C, modName, instName string) (module.Module, error) {
 	return &Static{
 		modName:  modName,
 		instName: instName,
@@ -40,7 +42,7 @@ func NewStatic(modName, instName string, _, _ []string) (module.Module, error) {
 	}, nil
 }
 
-func (s *Static) Init(cfg *config.Map) error {
+func (s *Static) Configure(inlineArgs []string, cfg *config.Map) error {
 	cfg.Callback("entry", func(_ *config.Map, node config.Node) error {
 		if len(node.Args) < 2 {
 			return config.NodeErr(node, "expected at least one value")
@@ -68,6 +70,10 @@ func (s *Static) Lookup(ctx context.Context, key string) (string, bool, error) {
 	return val[0], true, nil
 }
 
+func (s *Static) LookupMulti(ctx context.Context, key string) ([]string, error) {
+	return s.m[key], nil
+}
+
 func init() {
-	module.Register("table.static", NewStatic)
+	modules.Register("table.static", NewStatic)
 }

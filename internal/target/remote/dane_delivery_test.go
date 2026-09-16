@@ -29,10 +29,13 @@ import (
 	"github.com/foxcpp/maddy/framework/module"
 	"github.com/foxcpp/maddy/internal/testutils"
 	miekgdns "github.com/miekg/dns"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func targetWithExtResolver(t *testing.T, zones map[string]mockdns.Zone) (*mockdns.Server, *Target) {
-	dnsSrv, err := mockdns.NewServerWithLogger(zones, testutils.Logger(t, "mockdns"), false)
+	l := testutils.Logger(t, "mockdns")
+	dnsSrv, err := mockdns.NewServerWithLogger(zones, l, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +79,9 @@ func tlsaRecord(name string, usage, matchType, selector uint8, cert string) map[
 
 func TestRemoteDelivery_DANE_Ok(t *testing.T) {
 	_, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	// RFC 7672, Section 2.2.2. "Non-CNAME" case.
@@ -97,7 +102,9 @@ func TestRemoteDelivery_DANE_Ok(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		assert.NoError(t, dnsSrv.Close())
+	}()
 	tgt.policies = append(tgt.policies,
 		&localPolicy{
 			minTLSLevel: module.TLSAuthenticated, // Established via DANE instead of PKIX.
@@ -110,7 +117,9 @@ func TestRemoteDelivery_DANE_Ok(t *testing.T) {
 
 func TestRemoteDelivery_DANE_CNAMEd_1(t *testing.T) {
 	_, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	// RFC 7672, Section 2.2.2. "Secure CNAME" case - TLSA at CNAME matches.
@@ -134,7 +143,9 @@ func TestRemoteDelivery_DANE_CNAMEd_1(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		assert.NoError(t, dnsSrv.Close())
+	}()
 	tgt.policies = append(tgt.policies,
 		&localPolicy{
 			minTLSLevel: module.TLSAuthenticated, // Established via DANE instead of PKIX.
@@ -147,7 +158,9 @@ func TestRemoteDelivery_DANE_CNAMEd_1(t *testing.T) {
 
 func TestRemoteDelivery_DANE_CNAMEd_2(t *testing.T) {
 	_, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	// RFC 7672, Section 2.2.2. "Secure CNAME" case - TLSA at initial name matches.
@@ -172,7 +185,9 @@ func TestRemoteDelivery_DANE_CNAMEd_2(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		assert.NoError(t, dnsSrv.Close())
+	}()
 	tgt.policies = append(tgt.policies,
 		&localPolicy{
 			minTLSLevel: module.TLSAuthenticated, // Established via DANE instead of PKIX.
@@ -185,7 +200,9 @@ func TestRemoteDelivery_DANE_CNAMEd_2(t *testing.T) {
 
 func TestRemoteDelivery_DANE_InsecureCNAMEDest(t *testing.T) {
 	clientCfg, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	// RFC 7672, Section 2.2.2. "Insecure CNAME" case - initial name is secure.
@@ -216,7 +233,9 @@ func TestRemoteDelivery_DANE_InsecureCNAMEDest(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		require.NoError(t, dnsSrv.Close())
+	}()
 	tgt.tlsConfig = clientCfg
 
 	_, err := testutils.DoTestDeliveryErr(t, tgt, "test@example.com", []string{"test@example.invalid"})
@@ -230,7 +249,9 @@ func TestRemoteDelivery_DANE_InsecureCNAMEDest(t *testing.T) {
 
 func TestRemoteDelivery_DANE_NonAD_TLSA_Ignore(t *testing.T) {
 	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	// RFC 7672, Section 2.2.2. "Non-CNAME" case - initial name is insecure.
@@ -249,7 +270,9 @@ func TestRemoteDelivery_DANE_NonAD_TLSA_Ignore(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		require.NoError(t, dnsSrv.Close())
+	}()
 
 	testutils.DoTestDelivery(t, tgt, "test@example.com", []string{"test@example.invalid"})
 	be.CheckMsg(t, 0, "test@example.com", []string{"test@example.invalid"})
@@ -257,7 +280,9 @@ func TestRemoteDelivery_DANE_NonAD_TLSA_Ignore(t *testing.T) {
 
 func TestRemoteDelivery_DANE_NonADIgnore_CNAME(t *testing.T) {
 	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	// RFC 7672, Section 2.2.2. "Insecure CNAME" case - initial name is insecure.
@@ -280,7 +305,9 @@ func TestRemoteDelivery_DANE_NonADIgnore_CNAME(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		require.NoError(t, dnsSrv.Close())
+	}()
 
 	testutils.DoTestDelivery(t, tgt, "test@example.com", []string{"test@example.invalid"})
 	be.CheckMsg(t, 0, "test@example.com", []string{"test@example.invalid"})
@@ -288,7 +315,9 @@ func TestRemoteDelivery_DANE_NonADIgnore_CNAME(t *testing.T) {
 
 func TestRemoteDelivery_DANE_SkipAUnauth(t *testing.T) {
 	clientCfg, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	zones := map[string]mockdns.Zone{
@@ -307,7 +336,9 @@ func TestRemoteDelivery_DANE_SkipAUnauth(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		require.NoError(t, dnsSrv.Close())
+	}()
 	tgt.tlsConfig = clientCfg
 
 	testutils.DoTestDelivery(t, tgt, "test@example.com", []string{"test@example.invalid"})
@@ -316,7 +347,9 @@ func TestRemoteDelivery_DANE_SkipAUnauth(t *testing.T) {
 
 func TestRemoteDelivery_DANE_Mismatch(t *testing.T) {
 	clientCfg, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	zones := map[string]mockdns.Zone{
@@ -336,7 +369,9 @@ func TestRemoteDelivery_DANE_Mismatch(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		require.NoError(t, dnsSrv.Close())
+	}()
 	tgt.tlsConfig = clientCfg
 
 	_, err := testutils.DoTestDeliveryErr(t, tgt, "test@example.com", []string{"test@example.invalid"})
@@ -350,7 +385,9 @@ func TestRemoteDelivery_DANE_Mismatch(t *testing.T) {
 
 func TestRemoteDelivery_DANE_NoRecord(t *testing.T) {
 	clientCfg, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	zones := map[string]mockdns.Zone{
@@ -364,7 +401,9 @@ func TestRemoteDelivery_DANE_NoRecord(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		require.NoError(t, dnsSrv.Close())
+	}()
 	tgt.tlsConfig = clientCfg
 
 	testutils.DoTestDelivery(t, tgt, "test@example.com", []string{"test@example.invalid"})
@@ -373,7 +412,9 @@ func TestRemoteDelivery_DANE_NoRecord(t *testing.T) {
 
 func TestRemoteDelivery_DANE_LookupErr(t *testing.T) {
 	clientCfg, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	zones := map[string]mockdns.Zone{
@@ -390,7 +431,9 @@ func TestRemoteDelivery_DANE_LookupErr(t *testing.T) {
 	}
 
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		require.NoError(t, dnsSrv.Close())
+	}()
 	tgt.tlsConfig = clientCfg
 
 	_, err := testutils.DoTestDeliveryErr(t, tgt, "test@example.com", []string{"test@example.invalid"})
@@ -404,7 +447,9 @@ func TestRemoteDelivery_DANE_LookupErr(t *testing.T) {
 
 func TestRemoteDelivery_DANE_NoTLS(t *testing.T) {
 	be, srv := testutils.SMTPServer(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	zones := map[string]mockdns.Zone{
@@ -423,7 +468,9 @@ func TestRemoteDelivery_DANE_NoTLS(t *testing.T) {
 		},
 	}
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		require.NoError(t, dnsSrv.Close())
+	}()
 
 	_, err := testutils.DoTestDeliveryErr(t, tgt, "test@example.com", []string{"test@example.invalid"})
 	if err == nil {
@@ -436,7 +483,9 @@ func TestRemoteDelivery_DANE_NoTLS(t *testing.T) {
 
 func TestRemoteDelivery_DANE_TLSError(t *testing.T) {
 	_, be, srv := testutils.SMTPServerSTARTTLS(t, "127.0.0.1:"+smtpPort)
-	defer srv.Close()
+	defer func() {
+		require.NoError(t, srv.Close())
+	}()
 	defer testutils.CheckSMTPConnLeak(t, srv)
 
 	zones := map[string]mockdns.Zone{
@@ -456,7 +505,9 @@ func TestRemoteDelivery_DANE_TLSError(t *testing.T) {
 		},
 	}
 	dnsSrv, tgt := targetWithExtResolver(t, zones)
-	defer dnsSrv.Close()
+	defer func() {
+		require.NoError(t, dnsSrv.Close())
+	}()
 
 	// Cause failure through version incompatibility.
 	tgt.tlsConfig = &tls.Config{

@@ -21,17 +21,23 @@ package table
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
+	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
+	sqliteprovider "github.com/foxcpp/maddy/internal/sqlite"
 	_ "github.com/lib/pq"
 )
 
 type SQL struct {
 	modName  string
 	instName string
+	prepare  func() error
 
 	namedArgs bool
 
@@ -43,7 +49,7 @@ type SQL struct {
 	del    *sql.Stmt
 }
 
-func NewSQL(modName, instName string, _, _ []string) (module.Module, error) {
+func NewSQL(_ *container.C, modName, instName string) (module.Module, error) {
 	return &SQL{
 		modName:  modName,
 		instName: instName,
@@ -58,7 +64,7 @@ func (s *SQL) InstanceName() string {
 	return s.instName
 }
 
-func (s *SQL) Init(cfg *config.Map) error {
+func (s *SQL) Configure(inlineArgs []string, cfg *config.Map) error {
 	var (
 		driver      string
 		initQueries []string
@@ -88,53 +94,62 @@ func (s *SQL) Init(cfg *config.Map) error {
 	if driver == "postgres" && s.namedArgs {
 		return config.NodeErr(cfg.Block, "PostgreSQL driver does not support named_args")
 	}
+	driver = sqliteprovider.MapDriverName(driver)
 
 	db, err := sql.Open(driver, strings.Join(dsnParts, " "))
 	if err != nil {
 		return config.NodeErr(cfg.Block, "failed to open db: %v", err)
 	}
 	s.db = db
+	s.prepare = func() error {
+		for _, init := range initQueries {
+			if _, err := db.Exec(init); err != nil {
+				return config.NodeErr(cfg.Block, "init query failed: %v", err)
+			}
+		}
 
-	for _, init := range initQueries {
-		if _, err := db.Exec(init); err != nil {
-			return config.NodeErr(cfg.Block, "init query failed: %v", err)
+		s.lookup, err = db.Prepare(lookupQuery)
+		if err != nil {
+			return fmt.Errorf("failed to prepare lookup query: %v", err)
 		}
+		if addQuery != "" {
+			s.add, err = db.Prepare(addQuery)
+			if err != nil {
+				return fmt.Errorf("failed to prepare add query: %v", err)
+			}
+		}
+		if listQuery != "" {
+			s.list, err = db.Prepare(listQuery)
+			if err != nil {
+				return config.NodeErr(cfg.Block, "failed to prepare list query: %v", err)
+			}
+		}
+		if setQuery != "" {
+			s.set, err = db.Prepare(setQuery)
+			if err != nil {
+				return config.NodeErr(cfg.Block, "failed to prepare set query: %v", err)
+			}
+		}
+		if removeQuery != "" {
+			s.del, err = db.Prepare(removeQuery)
+			if err != nil {
+				return config.NodeErr(cfg.Block, "failed to prepare del query: %v", err)
+			}
+		}
+		return nil
 	}
 
-	s.lookup, err = db.Prepare(lookupQuery)
-	if err != nil {
-		return config.NodeErr(cfg.Block, "failed to prepare lookup query: %v", err)
-	}
-	if addQuery != "" {
-		s.add, err = db.Prepare(addQuery)
-		if err != nil {
-			return config.NodeErr(cfg.Block, "failed to prepare add query: %v", err)
-		}
-	}
-	if listQuery != "" {
-		s.list, err = db.Prepare(listQuery)
-		if err != nil {
-			return config.NodeErr(cfg.Block, "failed to prepare list query: %v", err)
-		}
-	}
-	if setQuery != "" {
-		s.set, err = db.Prepare(setQuery)
-		if err != nil {
-			return config.NodeErr(cfg.Block, "failed to prepare set query: %v", err)
-		}
-	}
-	if removeQuery != "" {
-		s.del, err = db.Prepare(removeQuery)
-		if err != nil {
-			return config.NodeErr(cfg.Block, "failed to prepare del query: %v", err)
-		}
-	}
+	return s.prepare()
+}
 
+func (s *SQL) Start() error {
 	return nil
 }
 
-func (s *SQL) Close() error {
-	s.lookup.Close()
+func (s *SQL) Stop() error {
+	if err := s.lookup.Close(); err != nil {
+		log.DefaultLogger.Error("lookup query close failed", err)
+	}
 	return s.db.Close()
 }
 
@@ -149,7 +164,7 @@ func (s *SQL) Lookup(ctx context.Context, val string) (string, bool, error) {
 		row = s.lookup.QueryRowContext(ctx, val)
 	}
 	if err := row.Scan(&repl); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return "", false, nil
 		}
 		return "", false, fmt.Errorf("%s: lookup %s: %w", s.modName, val, err)
@@ -193,7 +208,9 @@ func (s *SQL) Keys() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: list: %w", s.modName, err)
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 	var list []string
 	for rows.Next() {
 		var key string
@@ -201,6 +218,9 @@ func (s *SQL) Keys() ([]string, error) {
 			return nil, fmt.Errorf("%s: list: %w", s.modName, err)
 		}
 		list = append(list, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%s: list: %w", s.modName, err)
 	}
 	return list, nil
 }
@@ -247,5 +267,5 @@ func (s *SQL) SetKey(k, v string) error {
 }
 
 func init() {
-	module.Register("table.sql_query", NewSQL)
+	modules.Register("table.sql_query", NewSQL)
 }

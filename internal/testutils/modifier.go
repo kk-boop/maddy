@@ -24,7 +24,9 @@ import (
 	"github.com/emersion/go-message/textproto"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 type Modifier struct {
@@ -36,13 +38,13 @@ type Modifier struct {
 	BodyErr     error
 
 	MailFrom map[string]string
-	RcptTo   map[string]string
+	RcptTo   map[string][]string
 	AddHdr   textproto.Header
 
 	UnclosedStates int
 }
 
-func (m Modifier) Init(*config.Map) error {
+func (m Modifier) Configure([]string, *config.Map) error {
 	return nil
 }
 
@@ -82,20 +84,20 @@ func (ms modifierState) RewriteSender(ctx context.Context, mailFrom string) (str
 	return mailFrom, nil
 }
 
-func (ms modifierState) RewriteRcpt(ctx context.Context, rcptTo string) (string, error) {
+func (ms modifierState) RewriteRcpt(ctx context.Context, rcptTo string) ([]string, error) {
 	if ms.m.RcptToErr != nil {
-		return "", ms.m.RcptToErr
+		return []string{""}, ms.m.RcptToErr
 	}
 
 	if ms.m.RcptTo == nil {
-		return rcptTo, nil
+		return []string{rcptTo}, nil
 	}
 
 	newRcptTo, ok := ms.m.RcptTo[rcptTo]
 	if ok {
 		return newRcptTo, nil
 	}
-	return rcptTo, nil
+	return []string{rcptTo}, nil
 }
 
 func (ms modifierState) RewriteBody(ctx context.Context, h *textproto.Header, body buffer.Buffer) error {
@@ -115,8 +117,7 @@ func (ms modifierState) Close() error {
 }
 
 func init() {
-	module.Register("test_modifier", func(_, _ string, _, _ []string) (module.Module, error) {
+	modules.Register("test_modifier", func(_ *container.C, _, _ string) (module.Module, error) {
 		return &Modifier{}, nil
 	})
-	module.RegisterInstance(&Modifier{}, nil)
 }

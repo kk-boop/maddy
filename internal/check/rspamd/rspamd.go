@@ -35,9 +35,11 @@ import (
 	"github.com/foxcpp/maddy/framework/config"
 	modconfig "github.com/foxcpp/maddy/framework/config/module"
 	tls2 "github.com/foxcpp/maddy/framework/config/tls"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/target"
 )
 
@@ -45,7 +47,7 @@ const modName = "check.rspamd"
 
 type Check struct {
 	instName string
-	log      log.Logger
+	log      *log.Logger
 
 	apiPath    string
 	flags      string
@@ -57,27 +59,20 @@ type Check struct {
 	errorRespAction   modconfig.FailAction
 	addHdrAction      modconfig.FailAction
 	rewriteSubjAction modconfig.FailAction
+	rejectAction      modconfig.FailAction
+	softRejectAction  modconfig.FailAction
 
 	client *http.Client
 }
 
-func New(modName, instName string, _, inlineArgs []string) (module.Module, error) {
-	c := &Check{
+func New(c *container.C, modName, instName string) (module.Module, error) {
+	chk := &Check{
 		instName: instName,
 		client:   http.DefaultClient,
-		log:      log.Logger{Name: modName, Debug: log.DefaultLogger.Debug},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}
 
-	switch len(inlineArgs) {
-	case 1:
-		c.apiPath = inlineArgs[0]
-	case 0:
-		c.apiPath = "http://127.0.0.1:11333"
-	default:
-		return nil, fmt.Errorf("%s: unexpected amount of inline arguments", modName)
-	}
-
-	return c, nil
+	return chk, nil
 }
 
 func (c *Check) Name() string {
@@ -88,14 +83,23 @@ func (c *Check) InstanceName() string {
 	return c.instName
 }
 
-func (c *Check) Init(cfg *config.Map) error {
+func (c *Check) Configure(inlineArgs []string, cfg *config.Map) error {
+	switch len(inlineArgs) {
+	case 1:
+		c.apiPath = inlineArgs[0]
+	case 0:
+		c.apiPath = "http://127.0.0.1:11333"
+	default:
+		return fmt.Errorf("%s: unexpected amount of inline arguments", modName)
+	}
+
 	var (
-		tlsConfig tls.Config
+		tlsConfig *tls.Config
 		flags     []string
 	)
 
 	cfg.Custom("tls_client", true, false, func() (interface{}, error) {
-		return tls.Config{}, nil
+		return &tls.Config{}, nil
 	}, tls2.TLSClientBlock, &tlsConfig)
 	cfg.String("api_path", false, false, c.apiPath, &c.apiPath)
 	cfg.String("settings_id", false, false, "", &c.settingsID)
@@ -117,6 +121,15 @@ func (c *Check) Init(cfg *config.Map) error {
 		func() (interface{}, error) {
 			return modconfig.FailAction{Quarantine: true}, nil
 		}, modconfig.FailActionDirective, &c.rewriteSubjAction)
+	cfg.Custom("reject_action", false, false,
+		func() (interface{}, error) {
+			return modconfig.FailAction{Reject: true}, nil
+		}, modconfig.FailActionDirective, &c.rejectAction)
+	cfg.Custom("soft_reject_action", false, false,
+		func() (interface{}, error) {
+			return modconfig.FailAction{Reject: true}, nil
+		}, modconfig.FailActionDirective, &c.softRejectAction)
+
 	cfg.StringList("flags", false, false, []string{"pass_all"}, &flags)
 	if _, err := cfg.Process(); err != nil {
 		return err
@@ -124,7 +137,7 @@ func (c *Check) Init(cfg *config.Map) error {
 
 	c.client = &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tlsConfig,
+			TLSClientConfig: tlsConfig,
 		},
 	}
 	c.flags = strings.Join(flags, ",")
@@ -135,7 +148,7 @@ func (c *Check) Init(cfg *config.Map) error {
 type state struct {
 	c       *Check
 	msgMeta *module.MsgMetadata
-	log     log.Logger
+	log     *log.Logger
 
 	mailFrom string
 	rcpt     []string
@@ -266,7 +279,11 @@ func (s *state) CheckBody(ctx context.Context, hdr textproto.Header, body buffer
 			},
 		})
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			s.log.Error("failed to close response body", err)
+		}
+	}()
 
 	var respData response
 	if err := json.NewDecoder(resp.Body).Decode(&respData); err != nil {
@@ -320,7 +337,7 @@ func (s *state) CheckBody(ctx context.Context, hdr textproto.Header, body buffer
 			Header: hdrAdd,
 		})
 	case "soft reject":
-		return module.CheckResult{
+		return s.c.softRejectAction.Apply(module.CheckResult{
 			Reject: true,
 			Reason: &exterrors.SMTPError{
 				Code:         450,
@@ -329,9 +346,9 @@ func (s *state) CheckBody(ctx context.Context, hdr textproto.Header, body buffer
 				CheckName:    modName,
 				Misc:         map[string]interface{}{"action": "soft reject"},
 			},
-		}
+		})
 	case "reject":
-		return module.CheckResult{
+		return s.c.rejectAction.Apply(module.CheckResult{
 			Reject: true,
 			Reason: &exterrors.SMTPError{
 				Code:         550,
@@ -340,7 +357,7 @@ func (s *state) CheckBody(ctx context.Context, hdr textproto.Header, body buffer
 				CheckName:    modName,
 				Misc:         map[string]interface{}{"action": "reject"},
 			},
-		}
+		})
 	}
 
 	s.log.Msg("unhandled action", "action", respData.Action)
@@ -363,5 +380,5 @@ func (s *state) Close() error {
 }
 
 func init() {
-	module.Register(modName, New)
+	modules.Register(modName, New)
 }

@@ -25,8 +25,10 @@ import (
 	"path/filepath"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/internal/auth/external"
 )
 
@@ -35,16 +37,13 @@ type Auth struct {
 	useHelper  bool
 	helperPath string
 
-	Log log.Logger
+	Log *log.Logger
 }
 
-func New(modName, instName string, _, inlineArgs []string) (module.Module, error) {
-	if len(inlineArgs) != 0 {
-		return nil, errors.New("pam: inline arguments are not used")
-	}
+func New(c *container.C, modName, instName string) (module.Module, error) {
 	return &Auth{
 		instName: instName,
-		Log:      log.Logger{Name: modName},
+		Log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
@@ -56,7 +55,11 @@ func (a *Auth) InstanceName() string {
 	return a.instName
 }
 
-func (a *Auth) Init(cfg *config.Map) error {
+func (a *Auth) Configure(inlineArgs []string, cfg *config.Map) error {
+	if len(inlineArgs) != 0 {
+		return errors.New("pam: inline arguments are not used")
+	}
+
 	cfg.Bool("debug", true, false, &a.Log.Debug)
 	cfg.Bool("use_helper", false, false, &a.useHelper)
 	if _, err := cfg.Process(); err != nil {
@@ -90,5 +93,5 @@ func (a *Auth) AuthPlain(username, password string) error {
 }
 
 func init() {
-	module.Register("auth.pam", New)
+	modules.Register("auth.pam", New)
 }

@@ -30,6 +30,7 @@ import (
 
 	"github.com/emersion/go-message/textproto"
 	"github.com/emersion/go-msgauth/authres"
+	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/go-mockdns"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/exterrors"
@@ -54,12 +55,12 @@ func doTestDelivery(t *testing.T, tgt module.DeliveryTarget, from string, to []s
 		panic(err)
 	}
 
-	delivery, err := tgt.Start(context.Background(), &ctx, from)
+	delivery, err := tgt.StartDelivery(context.Background(), &ctx, from)
 	if err != nil {
 		return encodedID, err
 	}
 	for _, rcpt := range to {
-		if err := delivery.AddRcpt(context.Background(), rcpt); err != nil {
+		if err := delivery.AddRcpt(context.Background(), rcpt, smtp.RcptOptions{}); err != nil {
 			if err := delivery.Abort(context.Background()); err != nil {
 				t.Log("delivery.Abort:", err)
 			}

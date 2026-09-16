@@ -79,14 +79,17 @@ func (ctx *parseContext) resolveImport(node Node, name string, expansionDepth in
 		return subtree, nil
 	}
 
-	file := filepath.Join(filepath.Dir(ctx.fileLocation), name)
+	file := name
+	if !filepath.IsAbs(name) {
+		file = filepath.Join(filepath.Dir(ctx.fileLocation), name)
+	}
 	src, err := os.Open(file)
 	if err != nil {
 		if os.IsNotExist(err) {
 			src, err = os.Open(file + ".conf")
 			if err != nil {
 				if os.IsNotExist(err) {
-					return nil, NodeErr(node, "unknown import: "+name)
+					return nil, NodeErr(node, "unknown import: %s", name)
 				}
 				return nil, err
 			}
@@ -166,7 +169,7 @@ func (ctx *parseContext) expandSingleValueMacro(arg string) (string, error) {
 			value = ctx.macros[macroName][0]
 		}
 
-		arg = strings.Replace(arg, "$("+macroName+")", value, -1)
+		arg = strings.ReplaceAll(arg, "$("+macroName+")", value)
 	}
 
 	return arg, nil

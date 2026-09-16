@@ -7,7 +7,7 @@ import (
 // TODO: Migrate to using actual zapcore to improve logging performance
 
 type zapLogger struct {
-	L Logger
+	L *Logger
 }
 
 func (l zapLogger) Enabled(level zapcore.Level) bool {
@@ -46,9 +46,14 @@ func (l zapLogger) Write(entry zapcore.Entry, fields []zapcore.Field) error {
 		f.AddTo(enc)
 	}
 	if entry.LoggerName != "" {
-		l.L.Name += "/" + entry.LoggerName
+		l.L.logNameOverwrite(
+			l.L.Name+"/"+entry.LoggerName,
+			entry.Level == zapcore.DebugLevel,
+			l.L.formatMsg(entry.Message, enc.Fields),
+		)
+	} else {
+		l.L.log(entry.Level == zapcore.DebugLevel, l.L.formatMsg(entry.Message, enc.Fields))
 	}
-	l.L.log(entry.Level == zapcore.DebugLevel, l.L.formatMsg(entry.Message, enc.Fields))
 	return nil
 }
 

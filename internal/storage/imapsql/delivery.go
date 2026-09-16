@@ -20,11 +20,13 @@ package imapsql
 
 import (
 	"context"
+	"errors"
 	"runtime/trace"
 
-	specialuse "github.com/emersion/go-imap-specialuse"
+	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
 	"github.com/emersion/go-message/textproto"
+	"github.com/emersion/go-smtp"
 	imapsql "github.com/foxcpp/go-imap-sql"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/exterrors"
@@ -32,13 +34,16 @@ import (
 	"github.com/foxcpp/maddy/internal/target"
 )
 
+type addedRcpt struct {
+	rcptTo string
+}
 type delivery struct {
 	store    *Storage
 	msgMeta  *module.MsgMetadata
 	d        imapsql.Delivery
 	mailFrom string
 
-	addedRcpts map[string]struct{}
+	addedRcpts map[string]addedRcpt
 }
 
 func (d *delivery) String() string {
@@ -55,7 +60,7 @@ func userDoesNotExist(actual error) error {
 	}
 }
 
-func (d *delivery) AddRcpt(ctx context.Context, rcptTo string) error {
+func (d *delivery) AddRcpt(ctx context.Context, rcptTo string, _ smtp.RcptOptions) error {
 	defer trace.StartRegion(ctx, "sql/AddRcpt").End()
 
 	accountName, err := d.store.deliveryNormalize(ctx, rcptTo)
@@ -74,10 +79,11 @@ func (d *delivery) AddRcpt(ctx context.Context, rcptTo string) error {
 	userHeader.Add("Delivered-To", accountName)
 
 	if err := d.d.AddRcpt(accountName, userHeader); err != nil {
-		if err == imapsql.ErrUserDoesntExists || err == backend.ErrNoSuchMailbox {
+		if errors.Is(err, imapsql.ErrUserDoesntExists) || errors.Is(err, backend.ErrNoSuchMailbox) {
 			return userDoesNotExist(err)
 		}
-		if _, ok := err.(imapsql.SerializationError); ok {
+		var serializationError imapsql.SerializationError
+		if errors.As(err, &serializationError) {
 			return &exterrors.SMTPError{
 				Code:         453,
 				EnhancedCode: exterrors.EnhancedCode{4, 3, 2},
@@ -89,7 +95,9 @@ func (d *delivery) AddRcpt(ctx context.Context, rcptTo string) error {
 		return err
 	}
 
-	d.addedRcpts[accountName] = struct{}{}
+	d.addedRcpts[accountName] = addedRcpt{
+		rcptTo: rcptTo,
+	}
 	return nil
 }
 
@@ -97,10 +105,10 @@ func (d *delivery) Body(ctx context.Context, header textproto.Header, body buffe
 	defer trace.StartRegion(ctx, "sql/Body").End()
 
 	if !d.msgMeta.Quarantine && d.store.filters != nil {
-		for rcpt := range d.addedRcpts {
-			folder, flags, err := d.store.filters.IMAPFilter(rcpt, d.msgMeta, header, body)
+		for rcpt, rcptData := range d.addedRcpts {
+			folder, flags, err := d.store.filters.IMAPFilter(rcpt, rcptData.rcptTo, d.msgMeta, header, body)
 			if err != nil {
-				d.store.Log.Error("IMAPFilter failed", err, "rcpt", rcpt)
+				d.store.log.Error("IMAPFilter failed", err, "rcpt", rcpt)
 				continue
 			}
 			d.d.UserMailbox(rcpt, folder, flags)
@@ -108,12 +116,13 @@ func (d *delivery) Body(ctx context.Context, header textproto.Header, body buffe
 	}
 
 	if d.msgMeta.Quarantine {
-		if err := d.d.SpecialMailbox(specialuse.Junk, d.store.junkMbox); err != nil {
-			if _, ok := err.(imapsql.SerializationError); ok {
+		if err := d.d.SpecialMailbox(imap.JunkAttr, d.store.junkMbox); err != nil {
+			var serializationError imapsql.SerializationError
+			if errors.As(err, &serializationError) {
 				return &exterrors.SMTPError{
 					Code:         453,
 					EnhancedCode: exterrors.EnhancedCode{4, 3, 2},
-					Message:      "Storage access serialiation problem, try again later",
+					Message:      "Internal server error, try again later",
 					TargetName:   "imapsql",
 					Err:          err,
 				}
@@ -125,11 +134,12 @@ func (d *delivery) Body(ctx context.Context, header textproto.Header, body buffe
 	header = header.Copy()
 	header.Add("Return-Path", "<"+target.SanitizeForHeader(d.mailFrom)+">")
 	err := d.d.BodyParsed(header, body.Len(), body)
-	if _, ok := err.(imapsql.SerializationError); ok {
+	var serializationError imapsql.SerializationError
+	if errors.As(err, &serializationError) {
 		return &exterrors.SMTPError{
 			Code:         453,
 			EnhancedCode: exterrors.EnhancedCode{4, 3, 2},
-			Message:      "Storage access serialiation problem, try again later",
+			Message:      "Internal server error, try again later",
 			TargetName:   "imapsql",
 			Err:          err,
 		}
@@ -149,14 +159,14 @@ func (d *delivery) Commit(ctx context.Context) error {
 	return d.d.Commit()
 }
 
-func (store *Storage) Start(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
-	defer trace.StartRegion(ctx, "sql/Start").End()
+func (store *Storage) StartDelivery(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
+	defer trace.StartRegion(ctx, "sql/StartDelivery").End()
 
 	return &delivery{
 		store:      store,
 		msgMeta:    msgMeta,
 		mailFrom:   mailFrom,
 		d:          store.Back.NewDelivery(),
-		addedRcpts: map[string]struct{}{},
+		addedRcpts: map[string]addedRcpt{},
 	}, nil
 }

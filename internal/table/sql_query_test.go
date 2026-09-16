@@ -1,4 +1,5 @@
-//+build !nosqlite3,cgo
+//go:build !nosqlite3 && cgo
+// +build !nosqlite3,cgo
 
 /*
 Maddy Mail Server - Composable all-in-one email server.
@@ -27,17 +28,18 @@ import (
 	"testing"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/internal/testutils"
 )
 
 func TestSQL(t *testing.T) {
 	path := testutils.Dir(t)
-	mod, err := NewSQL("sql_table", "", nil, nil)
+	mod, err := NewSQL(container.New(), "sql_table", "")
 	if err != nil {
 		t.Fatal("Module create failed:", err)
 	}
 	tbl := mod.(*SQL)
-	err = tbl.Init(config.NewMap(nil, config.Node{
+	err = tbl.Configure(nil, config.NewMap(nil, config.Node{
 		Children: []config.Node{
 			{
 				Name: "driver",
@@ -64,6 +66,9 @@ func TestSQL(t *testing.T) {
 	}))
 	if err != nil {
 		t.Fatal("Init failed:", err)
+	}
+	if err := tbl.Start(); err != nil {
+		t.Fatal(err)
 	}
 
 	check := func(key, res string, ok, fail bool) {

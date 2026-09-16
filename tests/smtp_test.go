@@ -1,4 +1,5 @@
-//+build integration
+//go:build integration
+// +build integration
 
 /*
 Maddy Mail Server - Composable all-in-one email server.
@@ -22,6 +23,7 @@ package tests_test
 
 import (
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"path/filepath"
 	"strings"
@@ -63,6 +65,94 @@ func TestCheckRequireTLS(tt *testing.T) {
 	conn.SMTPNegotation("localhost", nil, nil)
 	conn.Writeln("MAIL FROM:<testing@two.maddy.test>")
 	conn.ExpectPattern("250 *")
+	conn.Writeln("QUIT")
+	conn.ExpectPattern("221 *")
+}
+
+func TestProxyProtocolTrustedSource(tt *testing.T) {
+	tt.Parallel()
+	t := tests.NewT(tt)
+	t.DNS(map[string]mockdns.Zone{
+		"one.maddy.test.": {
+			TXT: []string{"v=spf1 ip4:127.0.0.17 -all"},
+		},
+	})
+	t.Port("smtp")
+	t.Config(`
+		smtp tcp://127.0.0.1:{env:TEST_PORT_smtp} {
+			hostname mx.maddy.test
+			tls off
+
+			proxy_protocol {
+				trust ` + tests.DefaultSourceIP.String() + ` ::1/128
+				tls off
+			}
+
+			defer_sender_reject no
+
+			check {
+				spf {
+					enforce_early yes
+					fail_action reject
+				}
+			}
+
+			deliver_to dummy
+		}
+	`)
+	t.Run(1)
+	defer t.Close()
+
+	conn := t.Conn("smtp")
+	defer conn.Close()
+	conn.Writeln(fmt.Sprintf("PROXY TCP4 127.0.0.17 %s 12345 %d", tests.DefaultSourceIP.String(), t.Port("smtp")))
+	conn.SMTPNegotation("localhost", nil, nil)
+	conn.Writeln("MAIL FROM:<testing@one.maddy.test>")
+	conn.ExpectPattern("250 *")
+	conn.Writeln("QUIT")
+	conn.ExpectPattern("221 *")
+}
+
+func TestProxyProtocolUntrustedSource(tt *testing.T) {
+	tt.Parallel()
+	t := tests.NewT(tt)
+	t.DNS(map[string]mockdns.Zone{
+		"one.maddy.test.": {
+			TXT: []string{"v=spf1 ip4:127.0.0.17 -all"},
+		},
+	})
+	t.Port("smtp")
+	t.Config(`
+		smtp tcp://127.0.0.1:{env:TEST_PORT_smtp} {
+			hostname mx.maddy.test
+			tls off
+
+			proxy_protocol {
+				trust fe80::bad/128
+				tls off
+			}
+
+			defer_sender_reject no
+
+			check {
+				spf {
+					enforce_early yes
+					fail_action reject
+				}
+			}
+
+			deliver_to dummy
+		}
+	`)
+	t.Run(1)
+	defer t.Close()
+
+	conn := t.Conn("smtp")
+	defer conn.Close()
+	conn.Writeln(fmt.Sprintf("PROXY TCP4 127.0.0.17 %s 12345 %d", tests.DefaultSourceIP.String(), t.Port("smtp")))
+	conn.SMTPNegotation("localhost", nil, nil)
+	conn.Writeln("MAIL FROM:<testing@one.maddy.test>")
+	conn.ExpectPattern("550 *")
 	conn.Writeln("QUIT")
 	conn.ExpectPattern("221 *")
 }
@@ -121,11 +211,20 @@ func TestCheckSPF(tt *testing.T) {
 
 	conn := t.Conn("smtp")
 	defer conn.Close()
-	conn.SMTPNegotation("localhost", nil, nil)
+	conn.SMTPNegotation("fail.maddy.test", nil, nil)
 
 	conn.Writeln("MAIL FROM:<testing@pass.maddy.test>")
 	conn.ExpectPattern("250 *")
 	conn.Writeln("RSET")
+	conn.ExpectPattern("250 *")
+
+	// Actually checks fail.maddy.test.
+	conn.Writeln("MAIL FROM:<>")
+	conn.ExpectPattern("552 5.7.0 *")
+
+	conn.SMTPNegotation("pass.maddy.test", nil, nil)
+
+	conn.Writeln("MAIL FROM:<>")
 	conn.ExpectPattern("250 *")
 
 	conn.Writeln("MAIL FROM:<testing@none.maddy.test>")
@@ -363,7 +462,7 @@ func TestCheckAuthorizeSender(tt *testing.T) {
 						auth_normalize precis_casefold
 						user_to_email static {
 							entry "test-user1" "test@example1.org"
-							entry "test-user2" "é@example1.org" 
+							entry "test-user2" "é@example1.org"
 						}
 					}
 				}

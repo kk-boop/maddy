@@ -30,7 +30,9 @@ import (
 	"time"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 type SelfSignedLoader struct {
@@ -40,14 +42,14 @@ type SelfSignedLoader struct {
 	cert tls.Certificate
 }
 
-func NewSelfSignedLoader(_, instName string, _, inlineArgs []string) (module.Module, error) {
+func NewSelfSignedLoader(_ *container.C, _, instName string) (module.Module, error) {
 	return &SelfSignedLoader{
-		instName:    instName,
-		serverNames: inlineArgs,
+		instName: instName,
 	}, nil
 }
 
-func (f *SelfSignedLoader) Init(cfg *config.Map) error {
+func (f *SelfSignedLoader) Configure(inlineArgs []string, cfg *config.Map) error {
+	f.serverNames = inlineArgs
 	if _, err := cfg.Process(); err != nil {
 		return err
 	}
@@ -108,5 +110,5 @@ func (f *SelfSignedLoader) ConfigureTLS(c *tls.Config) error {
 
 func init() {
 	var _ module.TLSLoader = &SelfSignedLoader{}
-	module.Register("tls.loader.self_signed", NewSelfSignedLoader)
+	modules.Register("tls.loader.self_signed", NewSelfSignedLoader)
 }

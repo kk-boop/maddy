@@ -31,6 +31,7 @@ import (
 	"sync"
 
 	"github.com/emersion/go-message/textproto"
+	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/maddy/framework/address"
 	"github.com/foxcpp/maddy/framework/buffer"
@@ -38,6 +39,7 @@ import (
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/internal/auth"
 )
 
 func limitReader(r io.Reader, n int64, err error) *limitedReader {
@@ -93,7 +95,19 @@ type Session struct {
 	delivery    module.Delivery
 	deliveryErr error
 
-	log log.Logger
+	log *log.Logger
+}
+
+func (s *Session) AuthMechanisms() []string {
+	return s.endp.saslAuth.SASLMechanisms()
+}
+
+func (s *Session) Auth(mech string) (sasl.Server, error) {
+	return s.endp.saslAuth.CreateSASL(mech, s.connState.RemoteAddr, func(identity string, data auth.ContextData) error {
+		s.connState.AuthUser = identity
+		s.connState.AuthPassword = data.Password
+		return nil
+	}), nil
 }
 
 func (s *Session) Reset() {
@@ -103,14 +117,19 @@ func (s *Session) Reset() {
 	if s.delivery != nil {
 		s.abort(s.msgCtx)
 	}
-	s.endp.Log.DebugMsg("reset")
+	s.endp.log.DebugMsg("reset")
 }
 
 func (s *Session) releaseLimits() {
-	_, domain, err := address.Split(s.mailFrom)
-	if err != nil {
-		return
+	domain := ""
+	if s.mailFrom != "" {
+		var err error
+		_, domain, err = address.Split(s.mailFrom)
+		if err != nil {
+			return
+		}
 	}
+
 	addr, ok := s.msgMeta.Conn.RemoteAddr.(*net.TCPAddr)
 	if !ok {
 		addr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}
@@ -120,7 +139,7 @@ func (s *Session) releaseLimits() {
 
 func (s *Session) abort(ctx context.Context) {
 	if err := s.delivery.Abort(ctx); err != nil {
-		s.endp.Log.Error("delivery abort failed", err)
+		s.endp.log.Error("delivery abort failed", err)
 	}
 	s.log.Msg("aborted", "msg_id", s.msgMeta.ID)
 	abortedSMTPTransactions.WithLabelValues(s.endp.name).Inc()
@@ -140,34 +159,19 @@ func (s *Session) cleanSession() {
 }
 
 func (s *Session) AuthPlain(username, password string) error {
-	if s.endp.serv.AuthDisabled {
-		return smtp.ErrAuthUnsupported
-	}
-
 	// Executed before authentication and session initialization.
-	if err := s.endp.pipeline.RunEarlyChecks(context.TODO(), &s.connState.ConnectionState); err != nil {
+	if err := s.endp.pipeline.RunEarlyChecks(context.TODO(), &s.connState); err != nil {
 		return s.endp.wrapErr("", true, "AUTH", err)
 	}
 
+	// saslAuth will handle AuthMap and AuthNormalize.
 	err := s.endp.saslAuth.AuthPlain(username, password)
 	if err != nil {
-		s.endp.Log.Error("authentication failed", err, "username", username, "src_ip", s.connState.RemoteAddr)
+		s.endp.log.Error("authentication failed", err, "username", username, "src_ip", s.connState.RemoteAddr)
 
 		failedLogins.WithLabelValues(s.endp.name).Inc()
 
-		if exterrors.IsTemporary(err) {
-			return &smtp.SMTPError{
-				Code:         454,
-				EnhancedCode: smtp.EnhancedCode{4, 7, 0},
-				Message:      "Temporary authentication failure",
-			}
-		}
-
-		return &smtp.SMTPError{
-			Code:         535,
-			EnhancedCode: smtp.EnhancedCode{5, 7, 8},
-			Message:      "Invalid credentials",
-		}
+		return s.endp.authErrorMap(err)
 	}
 
 	s.connState.AuthUser = username
@@ -253,7 +257,7 @@ func (s *Session) startDelivery(ctx context.Context, from string, opts smtp.Mail
 	mailCtx, mailTask := trace.NewTask(s.msgCtx, "MAIL FROM")
 	defer mailTask.End()
 
-	delivery, err := s.endp.pipeline.Start(mailCtx, msgMeta, cleanFrom)
+	delivery, err := s.endp.pipeline.StartDelivery(mailCtx, msgMeta, cleanFrom)
 	if err != nil {
 		s.msgCtx = nil
 		s.msgTask.End()
@@ -313,13 +317,13 @@ func (s *Session) fetchRDNSName(ctx context.Context) {
 			return
 		}
 
-		reason, misc := exterrors.UnwrapDNSErr(err)
-		misc["reason"] = reason
-		if !strings.HasSuffix(reason, "canceled") {
+		if !errors.Is(err, context.Canceled) {
 			// Often occurs when transaction completes before rDNS lookup and
 			// rDNS name was not actually needed. So do not log cancelation
 			// error if that's the case.
 
+			reason, misc := exterrors.UnwrapDNSErr(err)
+			misc["reason"] = reason
 			s.log.Error("rDNS error", exterrors.WithFields(err, misc), "src_ip", s.connState.RemoteAddr)
 		}
 		s.connState.RDNSName.Set(nil, err)
@@ -329,7 +333,7 @@ func (s *Session) fetchRDNSName(ctx context.Context) {
 	s.connState.RDNSName.Set(name, nil)
 }
 
-func (s *Session) Rcpt(to string) error {
+func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 	s.msgLock.Lock()
 	defer s.msgLock.Unlock()
 
@@ -357,7 +361,7 @@ func (s *Session) Rcpt(to string) error {
 	rcptCtx, rcptTask := trace.NewTask(s.msgCtx, "RCPT TO")
 	defer rcptTask.End()
 
-	if err := s.rcpt(rcptCtx, to); err != nil {
+	if err := s.rcpt(rcptCtx, to, opts); err != nil {
 		if s.loggedRcptErrors < s.endp.maxLoggedRcptErrors {
 			s.log.Error("RCPT error", err, "rcpt", to, "msg_id", s.msgMeta.ID)
 			s.loggedRcptErrors++
@@ -367,11 +371,11 @@ func (s *Session) Rcpt(to string) error {
 		}
 		return s.endp.wrapErr(s.msgMeta.ID, !s.opts.UTF8, "RCPT", err)
 	}
-	s.endp.Log.Msg("RCPT ok", "rcpt", to, "msg_id", s.msgMeta.ID)
+	s.endp.log.Msg("RCPT ok", "rcpt", to, "msg_id", s.msgMeta.ID)
 	return nil
 }
 
-func (s *Session) rcpt(ctx context.Context, to string) error {
+func (s *Session) rcpt(ctx context.Context, to string, opts *smtp.RcptOptions) error {
 	// INTERNATIONALIZATION: Do not permit non-ASCII addresses unless SMTPUTF8 is
 	// used.
 	if !address.IsASCII(to) && !s.opts.UTF8 {
@@ -390,7 +394,7 @@ func (s *Session) rcpt(ctx context.Context, to string) error {
 		}
 	}
 
-	return s.delivery.AddRcpt(ctx, cleanTo)
+	return s.delivery.AddRcpt(ctx, cleanTo, *opts)
 }
 
 func (s *Session) Logout() error {
@@ -407,11 +411,14 @@ func (s *Session) Logout() error {
 	if s.cancelRDNS != nil {
 		s.cancelRDNS()
 	}
+
+	s.endp.sessionCnt.Add(-1)
+
 	return nil
 }
 
 func (s *Session) prepareBody(r io.Reader) (textproto.Header, buffer.Buffer, error) {
-	limitr := limitReader(r, int64(s.endp.maxHeaderBytes), &exterrors.SMTPError{
+	limitr := limitReader(r, s.endp.maxHeaderBytes, &exterrors.SMTPError{
 		Code:         552,
 		EnhancedCode: exterrors.EnhancedCode{5, 3, 4},
 		Message:      "Message header size exceeds limit",
@@ -603,7 +610,7 @@ func (endp *Endpoint) wrapErr(msgId string, mangleUTF8 bool, command string, err
 	}
 
 	if smtpErr, ok := err.(*smtp.SMTPError); ok {
-		endp.Log.Printf("plain SMTP error returned, this is deprecated")
+		endp.log.Printf("plain SMTP error returned, this is deprecated")
 		res.Code = smtpErr.Code
 		res.EnhancedCode = smtpErr.EnhancedCode
 		res.Message = smtpErr.Message

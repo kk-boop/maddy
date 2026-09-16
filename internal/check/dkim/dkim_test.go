@@ -28,6 +28,7 @@ import (
 	"github.com/foxcpp/go-mockdns"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/exterrors"
 	"github.com/foxcpp/maddy/framework/module"
 	"github.com/foxcpp/maddy/internal/testutils"
@@ -84,7 +85,7 @@ Joe.
 
 func testCheck(t *testing.T, zones map[string]mockdns.Zone, cfg []config.Node) *Check {
 	t.Helper()
-	mod, err := New("check.dkim", "", nil, nil)
+	mod, err := New(container.New(), "check.dkim", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +93,7 @@ func testCheck(t *testing.T, zones map[string]mockdns.Zone, cfg []config.Node) *
 	check.resolver = &mockdns.Resolver{Zones: zones}
 	check.log = testutils.Logger(t, mod.Name())
 
-	if err := check.Init(config.NewMap(nil, config.Node{Children: cfg})); err != nil {
+	if err := check.Configure(nil, config.NewMap(nil, config.Node{Children: cfg})); err != nil {
 		t.Fatal(err)
 	}
 

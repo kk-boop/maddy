@@ -12,8 +12,10 @@ import (
 
 	"github.com/foxcpp/maddy/framework/config"
 	tls2 "github.com/foxcpp/maddy/framework/config/tls"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/go-ldap/ldap/v3"
 )
 
@@ -25,7 +27,7 @@ type Auth struct {
 	urls           []string
 	readBind       func(*ldap.Conn) error
 	startls        bool
-	tlsCfg         tls.Config
+	tlsCfg         *tls.Config
 	dialer         *net.Dialer
 	requestTimeout time.Duration
 
@@ -37,23 +39,24 @@ type Auth struct {
 	conn     *ldap.Conn
 	connLock sync.Mutex
 
-	log log.Logger
+	log *log.Logger
 }
 
-func New(modName, instName string, _, inlineArgs []string) (module.Module, error) {
+func New(c *container.C, modName, instName string) (module.Module, error) {
 	return &Auth{
 		instName: instName,
-		log:      log.Logger{Name: modName},
-		urls:     inlineArgs,
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
-func (a *Auth) Init(cfg *config.Map) error {
+func (a *Auth) Configure(inlineArgs []string, cfg *config.Map) error {
+	a.urls = inlineArgs
+
 	a.dialer = &net.Dialer{}
 
 	cfg.Bool("debug", true, false, &a.log.Debug)
 	cfg.Custom("tls_client", true, false, func() (interface{}, error) {
-		return tls.Config{}, nil
+		return &tls.Config{}, nil
 	}, tls2.TLSClientBlock, &a.tlsCfg)
 	cfg.Callback("urls", func(m *config.Map, node config.Node) error {
 		a.urls = append(a.urls, node.Args...)
@@ -87,15 +90,6 @@ func (a *Auth) Init(cfg *config.Map) error {
 		}
 	}
 
-	if module.NoRun {
-		return nil
-	}
-
-	var err error
-	a.conn, err = a.newConn()
-	if err != nil {
-		return fmt.Errorf("auth.ldap: %w", err)
-	}
 	return nil
 }
 
@@ -107,7 +101,14 @@ func readBindDirective(c *config.Map, n config.Node) (interface{}, error) {
 	case "off":
 		return func(*ldap.Conn) error { return nil }, nil
 	case "unauth":
-		return (*ldap.Conn).UnauthenticatedBind, nil
+		if len(n.Args) == 2 {
+			return func(c *ldap.Conn) error {
+				return c.UnauthenticatedBind(n.Args[1])
+			}, nil
+		}
+		return func(c *ldap.Conn) error {
+			return c.UnauthenticatedBind("")
+		}, nil
 	case "plain":
 		if len(n.Args) != 3 {
 			return nil, fmt.Errorf("auth.ldap: username and password expected for plaintext bind")
@@ -140,12 +141,12 @@ func (a *Auth) newConn() (*ldap.Conn, error) {
 			return nil, fmt.Errorf("auth.ldap: invalid server URL: %w", err)
 		}
 		hostname := parsedURL.Host
+		a.tlsCfg.ServerName = strings.Split(hostname, ":")[0]
 		tlsCfg = a.tlsCfg.Clone()
-		a.tlsCfg.ServerName = hostname
 
 		conn, err = ldap.DialURL(u, ldap.DialWithDialer(a.dialer), ldap.DialWithTLSConfig(tlsCfg))
 		if err != nil {
-			a.log.Msg("cannot contact directory server", err, "url", u)
+			a.log.Error("cannot contact directory server", err, "url", u)
 			continue
 		}
 		break
@@ -176,14 +177,18 @@ func (a *Auth) getConn() (*ldap.Conn, error) {
 	if a.conn == nil {
 		conn, err := a.newConn()
 		if err != nil {
+			a.connLock.Unlock()
 			return nil, err
 		}
 		a.conn = conn
 	}
 	if a.conn.IsClosing() {
-		a.conn.Close()
+		if err := a.conn.Close(); err != nil {
+			a.log.Error("Connection close failed", err)
+		}
 		conn, err := a.newConn()
 		if err != nil {
+			a.connLock.Unlock()
 			return nil, err
 		}
 		a.conn = conn
@@ -195,11 +200,15 @@ func (a *Auth) returnConn(conn *ldap.Conn) {
 	defer a.connLock.Unlock()
 	if err := a.readBind(conn); err != nil {
 		a.log.Error("failed to rebind for reading", err)
-		conn.Close()
+		if err := a.conn.Close(); err != nil {
+			a.log.Error("Connection close failed", err)
+		}
 		a.conn = nil
 	}
 	if a.conn != conn {
-		a.conn.Close()
+		if err := a.conn.Close(); err != nil {
+			a.log.Error("Connection close failed", err)
+		}
 	}
 	a.conn = conn
 }
@@ -218,7 +227,7 @@ func (a *Auth) Lookup(_ context.Context, username string) (string, bool, error) 
 		req := ldap.NewSearchRequest(
 			a.baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
 			2, 0, false,
-			strings.ReplaceAll(a.filterTemplate, "{username}", username),
+			strings.ReplaceAll(a.filterTemplate, "{username}", ldap.EscapeFilter(username)),
 			[]string{"dn"}, nil)
 		res, err := conn.Search(req)
 		if err != nil {
@@ -245,12 +254,12 @@ func (a *Auth) AuthPlain(username, password string) error {
 
 	var userDN string
 	if a.dnTemplate != "" {
-		userDN = strings.ReplaceAll(a.dnTemplate, "{username}", username)
+		userDN = strings.ReplaceAll(a.dnTemplate, "{username}", ldap.EscapeDN(username))
 	} else {
 		req := ldap.NewSearchRequest(
 			a.baseDN, ldap.ScopeWholeSubtree, ldap.NeverDerefAliases,
 			2, 0, false,
-			strings.ReplaceAll(a.filterTemplate, "{username}", username),
+			strings.ReplaceAll(a.filterTemplate, "{username}", ldap.EscapeFilter(username)),
 			[]string{"dn"}, nil)
 		res, err := conn.Search(req)
 		if err != nil {
@@ -272,9 +281,24 @@ func (a *Auth) AuthPlain(username, password string) error {
 	return nil
 }
 
+func (a *Auth) Start() error {
+	var err error
+	a.conn, err = a.newConn()
+	if err != nil {
+		return fmt.Errorf("auth.ldap: %w", err)
+	}
+	return nil
+}
+
+func (a *Auth) Stop() error {
+	a.connLock.Lock()
+	defer a.connLock.Unlock()
+	return a.conn.Close()
+}
+
 func init() {
 	var _ module.PlainAuth = &Auth{}
 	var _ module.Table = &Auth{}
-	module.Register(modName, New)
-	module.Register("table.ldap", New)
+	modules.Register(modName, New)
+	modules.Register("table.ldap", New)
 }

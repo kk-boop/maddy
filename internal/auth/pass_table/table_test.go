@@ -22,17 +22,18 @@ import (
 	"testing"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/internal/testutils"
 )
 
 func TestAuth_AuthPlain(t *testing.T) {
 	addSHA256()
 
-	mod, err := New("pass_table", "", nil, []string{"dummy"})
+	mod, err := New(container.New(), "pass_table", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = mod.Init(config.NewMap(nil, config.Node{
+	err = mod.Configure([]string{"dummy"}, config.NewMap(nil, config.Node{
 		Children: []config.Node{},
 	}))
 	if err != nil {

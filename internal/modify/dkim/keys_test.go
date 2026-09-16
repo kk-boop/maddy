@@ -22,7 +22,6 @@ import (
 	"crypto/ed25519"
 	"crypto/rsa"
 	"encoding/base64"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -35,11 +34,7 @@ func TestKeyLoad_new(t *testing.T) {
 	m := Modifier{}
 	m.log = testutils.Logger(t, m.Name())
 
-	dir, err := ioutil.TempDir("", "maddy-tests-dkim-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	signer, newKey, err := m.loadOrGenerateKey(filepath.Join(dir, "testkey.key"), "ed25519")
 	if err != nil {
@@ -49,7 +44,7 @@ func TestKeyLoad_new(t *testing.T) {
 		t.Fatal("newKey=false")
 	}
 
-	recordBlob, err := ioutil.ReadFile(filepath.Join(dir, "testkey.dns"))
+	recordBlob, err := os.ReadFile(filepath.Join(dir, "testkey.dns"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,13 +80,9 @@ func TestKeyLoad_existing_pkcs8(t *testing.T) {
 	m := Modifier{}
 	m.log = testutils.Logger(t, m.Name())
 
-	dir, err := ioutil.TempDir("", "maddy-tests-dkim-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
-	if err := ioutil.WriteFile(filepath.Join(dir, "testkey.key"), []byte(pkeyEd25519), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "testkey.key"), []byte(pkeyEd25519), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,13 +132,9 @@ func TestKeyLoad_existing_pkcs1(t *testing.T) {
 	m := Modifier{}
 	m.log = testutils.Logger(t, m.Name())
 
-	dir, err := ioutil.TempDir("", "maddy-tests-dkim-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
-	if err := ioutil.WriteFile(filepath.Join(dir, "testkey.key"), []byte(pkeyRSA), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "testkey.key"), []byte(pkeyRSA), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

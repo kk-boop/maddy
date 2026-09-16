@@ -35,7 +35,7 @@ Your options are:
     Available on [GitHub](https://github.com/foxcpp/maddy/releases) or
     [maddy.email/builds](https://maddy.email/builds/).
 
-	The tarball includes maddy and maddyctl executables you can
+	The tarball includes maddy executable you can
 	copy into /usr/local/bin as well as systemd unit file you can
 	use on systemd-based distributions for automatic startup and service
 	supervision. You should also create "maddy" user and group.
@@ -44,11 +44,10 @@ Your options are:
 * Docker image (Linux, amd64)
 
     ```
-    docker pull foxcpp/maddy:latest
+    docker pull foxcpp/maddy:0.6
     ```
 
-    See README at [hub.docker.com](https://hub.docker.com/r/foxcpp/maddy)
-    for Docker-specific instructions.
+    See [here](../../docker) for Docker-specific instructions.
 
 * Building from source
 
@@ -58,7 +57,7 @@ Your options are:
 
 	For Arch Linux users, `maddy` and `maddy-git` PKGBUILDs are available
 	in AUR. Additionally, binary packages are available in 3rd-party
-	repository at https://foxcpp.dev/archlinux/
+	repository at [https://maddy.email/archlinux/](https://maddy.email/archlinux/)
 
 ## System configuration (systemd-based distribution)
 
@@ -104,9 +103,14 @@ one as "primary". Add all other domains to the `local_domains` line:
 $(local_domains) = $(primary_domain) example.com other.example.com
 ```
 
+Do not forget to set a suitable rDNS (PTR) record for your server's IP address
+to reduce the chances of outgoing mails getting marked as spam or being
+downright rejected. Ideally, the PTR record should match whatever you specified
+in `$(hostname)`.
+
 ## TLS certificates
 
-One thing that can't be automagically configured is TLS certs. If you already
+One thing that can't be automatically configured is TLS certs. If you already
 have them somewhere - use them, open /etc/maddy/maddy.conf and put the right
 paths in. You need to make sure maddy can read them while running as
 unprivileged user (maddy never runs as root, even during start-up), one way to
@@ -169,7 +173,7 @@ mx1.example.org.   AAAA  2001:beef::1
 ; for this domain, and nobody else.
 example.org.     TXT   "v=spf1 mx ~all"
 ; It is recommended to server SPF record for both domain and MX hostname
-mx1.example.org. TXT   "v=spf1 mx ~all"
+mx1.example.org. TXT   "v=spf1 a ~all"
 
 ; Opt-in into DMARC with permissive policy and request reports about broken
 ; messages.
@@ -216,14 +220,14 @@ mx: mx2.example.org
 ```
 
 It is also recommended to set a TLSA (DANE) record.
-Use https://www.huque.com/bin/gen_tlsa to generate one. 
+Use https://www.huque.com/bin/gen_tlsa to generate one.
 Set port to 25, Transport Protocol to "tcp" and Domain Name to **the MX hostname**.
 Example of a valid record:
 ```
 _25._tcp.mx1.example.org. TLSA 3 1 1 7f59d873a70e224b184c95a4eb54caa9621e47d48b4a25d312d83d96e3498238
 ```
 
-## User accounts and maddyctl
+## User accounts and maddy command
 
 A mail server is useless without mailboxes, right? Unlike software like postfix
 and dovecot, maddy uses "virtual users" by default, meaning it does not care or
@@ -231,10 +235,10 @@ know about system users.
 
 IMAP mailboxes ("accounts") and authentication credentials are kept separate.
 
-To register user credentials, use `maddyctl creds create` command.
+To register user credentials, use `maddy creds create` command.
 Like that:
 ```
-$ maddyctl creds create postmaster@example.org
+$ maddy creds create postmaster@example.org
 ```
 
 Note the username is a e-mail address. This is required as username is used to
@@ -244,14 +248,17 @@ described here).
 After registering the user credentials, you also need to create a local
 storage account:
 ```
-$ maddyctl imap-acct create postmaster@example.org
+$ maddy imap-acct create postmaster@example.org
 ```
+
+Note: to run `maddy` CLI commands, your user should be in the `maddy`
+group. Alternatively, just use `sudo -u maddy`.
 
 That is it. Now you have your first e-mail address. when authenticating using
 your e-mail client, do not forget the username is "postmaster@example.org", not
 just "postmaster".
 
-You may find running `maddyctl creds --help` and `maddyctl imap-acct --help`
+You may find running `maddy creds --help` and `maddy imap-acct --help`
 useful to learn about other commands. Note that IMAP accounts and credentials
 are managed separately yet usernames should match by default for things to
 work.

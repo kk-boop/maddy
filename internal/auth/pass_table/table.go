@@ -25,30 +25,30 @@ import (
 
 	"github.com/foxcpp/maddy/framework/config"
 	modconfig "github.com/foxcpp/maddy/framework/config/module"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/text/secure/precis"
 )
 
 type Auth struct {
-	modName    string
-	instName   string
-	inlineArgs []string
+	modName  string
+	instName string
 
 	table module.Table
 }
 
-func New(modName, instName string, _, inlineArgs []string) (module.Module, error) {
+func New(_ *container.C, modName, instName string) (module.Module, error) {
 	return &Auth{
-		modName:    modName,
-		instName:   instName,
-		inlineArgs: inlineArgs,
+		modName:  modName,
+		instName: instName,
 	}, nil
 }
 
-func (a *Auth) Init(cfg *config.Map) error {
-	if len(a.inlineArgs) != 0 {
-		return modconfig.ModuleFromNode("table", a.inlineArgs, cfg.Block, cfg.Globals, &a.table)
+func (a *Auth) Configure(inlineArgs []string, cfg *config.Map) error {
+	if len(inlineArgs) != 0 {
+		return modconfig.ModuleFromNode("table", inlineArgs, cfg.Block, cfg.Globals, &a.table)
 	}
 
 	cfg.Custom("table", false, true, nil, modconfig.TableDirective, &a.table)
@@ -112,9 +112,19 @@ func (a *Auth) ListUsers() ([]string, error) {
 }
 
 func (a *Auth) CreateUser(username, password string) error {
+	return a.CreateUserHash(username, password, HashBcrypt, HashOpts{
+		BcryptCost: bcrypt.DefaultCost,
+	})
+}
+
+func (a *Auth) CreateUserHash(username, password string, hashAlgo string, opts HashOpts) error {
 	tbl, ok := a.table.(module.MutableTable)
 	if !ok {
 		return fmt.Errorf("%s: table is not mutable, no management functionality available", a.modName)
+	}
+
+	if _, ok := HashCompute[hashAlgo]; !ok {
+		return fmt.Errorf("%s: unknown hash function: %v", a.modName, hashAlgo)
 	}
 
 	key, err := precis.UsernameCaseMapped.CompareKey(username)
@@ -130,15 +140,12 @@ func (a *Auth) CreateUser(username, password string) error {
 		return fmt.Errorf("%s: credentials for %s already exist", a.modName, key)
 	}
 
-	// TODO: Allow to customize hash function.
-	hash, err := HashCompute[HashBcrypt](HashOpts{
-		BcryptCost: bcrypt.DefaultCost,
-	}, password)
+	hash, err := HashCompute[hashAlgo](opts, password)
 	if err != nil {
 		return fmt.Errorf("%s: create user %s: hash generation: %w", a.modName, key, err)
 	}
 
-	if err := tbl.SetKey(key, "bcrypt:"+hash); err != nil {
+	if err := tbl.SetKey(key, hashAlgo+":"+hash); err != nil {
 		return fmt.Errorf("%s: create user %s: %w", a.modName, key, err)
 	}
 	return nil
@@ -187,5 +194,5 @@ func (a *Auth) DeleteUser(username string) error {
 }
 
 func init() {
-	module.Register("auth.pass_table", New)
+	modules.Register("auth.pass_table", New)
 }

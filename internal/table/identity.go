@@ -22,7 +22,9 @@ import (
 	"context"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 type Identity struct {
@@ -30,14 +32,14 @@ type Identity struct {
 	instName string
 }
 
-func NewIdentity(modName, instName string, _, _ []string) (module.Module, error) {
+func NewIdentity(_ *container.C, modName, instName string) (module.Module, error) {
 	return &Identity{
 		modName:  modName,
 		instName: instName,
 	}, nil
 }
 
-func (s *Identity) Init(cfg *config.Map) error {
+func (s *Identity) Configure(inlineArgs []string, cfg *config.Map) error {
 	return nil
 }
 
@@ -54,5 +56,5 @@ func (s *Identity) Lookup(_ context.Context, key string) (string, bool, error) {
 }
 
 func init() {
-	module.Register("table.identity", NewIdentity)
+	modules.Register("table.identity", NewIdentity)
 }

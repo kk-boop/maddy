@@ -20,6 +20,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -134,6 +135,59 @@ func (m *Map) Enum(name string, inheritGlobal, required bool, allowed []string, 
 	}, store)
 }
 
+// EnumMapped is similar to Map.Enum but maps a stirng to a custom type.
+func EnumMapped[V any](m *Map, name string, inheritGlobal, required bool, mapped map[string]V, defaultVal V, store *V) {
+	m.Custom(name, inheritGlobal, required, func() (interface{}, error) {
+		return defaultVal, nil
+	}, func(_ *Map, node Node) (interface{}, error) {
+		if len(node.Children) != 0 {
+			return nil, NodeErr(node, "can't declare a block here")
+		}
+		if len(node.Args) != 1 {
+			return nil, NodeErr(node, "expected exactly one argument")
+		}
+
+		val, ok := mapped[node.Args[0]]
+		if !ok {
+			validValues := make([]string, 0, len(mapped))
+			for k := range mapped {
+				validValues = append(validValues, k)
+			}
+			return nil, NodeErr(node, "invalid argument, valid values are: %v", validValues)
+		}
+
+		return val, nil
+	}, store)
+}
+
+// EnumListMapped is similar to Map.EnumList but maps a stirng to a custom type.
+func EnumListMapped[V any](m *Map, name string, inheritGlobal, required bool, mapped map[string]V, defaultVal []V, store *[]V) {
+	m.Custom(name, inheritGlobal, required, func() (interface{}, error) {
+		return defaultVal, nil
+	}, func(_ *Map, node Node) (interface{}, error) {
+		if len(node.Children) != 0 {
+			return nil, NodeErr(node, "can't declare a block here")
+		}
+		if len(node.Args) == 0 {
+			return nil, NodeErr(node, "expected at least one argument")
+		}
+
+		values := make([]V, 0, len(node.Args))
+		for _, arg := range node.Args {
+			val, ok := mapped[arg]
+			if !ok {
+				validValues := make([]string, 0, len(mapped))
+				for k := range mapped {
+					validValues = append(validValues, k)
+				}
+				return nil, NodeErr(node, "invalid argument, valid values are: %v", validValues)
+			}
+			values = append(values, val)
+		}
+		return values, nil
+	}, store)
+}
+
 // Duration maps configuration directive to a time.Duration variable.
 //
 // Directive must be in form 'name duration' where duration is any string accepted by
@@ -231,7 +285,7 @@ func ParseDataSize(s string) (int, error) {
 // data unit and allows multiple arguments (they will be added together).
 //
 // See Map.Custom for description of arguments.
-func (m *Map) DataSize(name string, inheritGlobal, required bool, defaultVal int, store *int) {
+func (m *Map) DataSize(name string, inheritGlobal, required bool, defaultVal int64, store *int64) {
 	m.Custom(name, inheritGlobal, required, func() (interface{}, error) {
 		return defaultVal, nil
 	}, func(_ *Map, node Node) (interface{}, error) {
@@ -248,8 +302,18 @@ func (m *Map) DataSize(name string, inheritGlobal, required bool, defaultVal int
 			return nil, NodeErr(node, "%v", err)
 		}
 
-		return dur, nil
+		return int64(dur), nil
 	}, store)
+}
+
+func ParseBool(s string) (bool, error) {
+	switch strings.ToLower(s) {
+	case "1", "true", "on", "yes":
+		return true, nil
+	case "0", "false", "off", "no":
+		return false, nil
+	}
+	return false, fmt.Errorf("bool argument should be 'yes' or 'no'")
 }
 
 // Bool maps presence of some configuration directive to a boolean variable.
@@ -274,13 +338,11 @@ func (m *Map) Bool(name string, inheritGlobal, defaultVal bool, store *bool) {
 			return nil, NodeErr(node, "expected exactly 1 argument")
 		}
 
-		switch strings.ToLower(node.Args[0]) {
-		case "1", "true", "on", "yes":
-			return true, nil
-		case "0", "false", "off", "no":
-			return false, nil
+		b, err := ParseBool(node.Args[0])
+		if err != nil {
+			return nil, NodeErr(node, "bool argument should be 'yes' or 'no'")
 		}
-		return nil, NodeErr(node, "bool argument should be 'yes' or 'no'")
+		return b, nil
 	}, store)
 }
 

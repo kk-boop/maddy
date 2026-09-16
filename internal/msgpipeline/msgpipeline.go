@@ -61,7 +61,7 @@ type MsgPipeline struct {
 	// exactly in this place.
 	FirstPipeline bool
 
-	Log log.Logger
+	Log *log.Logger
 }
 
 type rcptIn struct {
@@ -90,10 +90,11 @@ func New(globals map[string]interface{}, cfg []config.Node) (*MsgPipeline, error
 	return &MsgPipeline{
 		msgpipelineCfg: parsedCfg,
 		Resolver:       dns.DefaultResolver(),
+		Log:            log.DefaultLogger.Sublogger("msgpipeline"),
 	}, err
 }
 
-func (d *MsgPipeline) RunEarlyChecks(ctx context.Context, state *smtp.ConnectionState) error {
+func (d *MsgPipeline) RunEarlyChecks(ctx context.Context, state *module.ConnState) error {
 	eg, checkCtx := errgroup.WithContext(ctx)
 
 	// TODO: See if there is some point in parallelization of this
@@ -111,13 +112,13 @@ func (d *MsgPipeline) RunEarlyChecks(ctx context.Context, state *smtp.Connection
 	return eg.Wait()
 }
 
-// Start starts new message delivery, runs connection and sender checks, sender modifiers
+// StartDelivery starts new message delivery, runs connection and sender checks, sender modifiers
 // and selects source block from config to use for handling.
 //
 // Returned module.Delivery implements PartialDelivery. If underlying target doesn't
 // support it, msgpipeline will copy the returned error for all recipients handled
 // by target.
-func (d *MsgPipeline) Start(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
+func (d *MsgPipeline) StartDelivery(ctx context.Context, msgMeta *module.MsgMetadata, mailFrom string) (module.Delivery, error) {
 	dd := msgpipelineDelivery{
 		d:                  d,
 		rcptModifiersState: make(map[*rcptBlock]module.ModifierState),
@@ -186,7 +187,9 @@ func (dd *msgpipelineDelivery) initRunGlobalModifiers(ctx context.Context, msgMe
 	}
 	mailFrom, err = globalModifiersState.RewriteSender(ctx, mailFrom)
 	if err != nil {
-		globalModifiersState.Close()
+		if err := globalModifiersState.Close(); err != nil {
+			dd.log.Error("failed to close global modifiers state", err)
+		}
 		return "", err
 	}
 	dd.globalModifiersState = globalModifiersState
@@ -267,7 +270,7 @@ type msgpipelineDelivery struct {
 	sourceModifiersState module.ModifierState
 	rcptModifiersState   map[*rcptBlock]module.ModifierState
 
-	log log.Logger
+	log *log.Logger
 
 	sourceAddr  string
 	sourceBlock sourceBlock
@@ -277,7 +280,7 @@ type msgpipelineDelivery struct {
 	checkRunner *checkRunner
 }
 
-func (dd *msgpipelineDelivery) AddRcpt(ctx context.Context, to string) error {
+func (dd *msgpipelineDelivery) AddRcpt(ctx context.Context, to string, opts smtp.RcptOptions) error {
 	if err := dd.checkRunner.checkRcpt(ctx, dd.d.globalChecks, to); err != nil {
 		return err
 	}
@@ -292,75 +295,86 @@ func (dd *msgpipelineDelivery) AddRcpt(ctx context.Context, to string) error {
 		return err
 	}
 	dd.log.Debugln("global rcpt modifiers:", to, "=>", newTo)
-	to = newTo
-	newTo, err = dd.sourceModifiersState.RewriteRcpt(ctx, to)
-	if err != nil {
-		return err
+	resultTo := newTo
+	newTo = []string{}
+
+	for _, to = range resultTo {
+		var tempTo []string
+		tempTo, err = dd.sourceModifiersState.RewriteRcpt(ctx, to)
+		if err != nil {
+			return err
+		}
+		newTo = append(newTo, tempTo...)
 	}
 	dd.log.Debugln("per-source rcpt modifiers:", to, "=>", newTo)
-	to = newTo
+	resultTo = newTo
 
-	wrapErr := func(err error) error {
-		return exterrors.WithFields(err, map[string]interface{}{
-			"effective_rcpt": to,
-		})
-	}
-
-	rcptBlock, err := dd.rcptBlockForAddr(ctx, to)
-	if err != nil {
-		return wrapErr(err)
-	}
-
-	if rcptBlock.rejectErr != nil {
-		return wrapErr(rcptBlock.rejectErr)
-	}
-
-	if err := dd.checkRunner.checkRcpt(ctx, rcptBlock.checks, to); err != nil {
-		return wrapErr(err)
-	}
-
-	rcptModifiersState, err := dd.getRcptModifiers(ctx, rcptBlock, to)
-	if err != nil {
-		return wrapErr(err)
-	}
-
-	newTo, err = rcptModifiersState.RewriteRcpt(ctx, to)
-	if err != nil {
-		rcptModifiersState.Close()
-		return wrapErr(err)
-	}
-	dd.log.Debugln("per-rcpt modifiers:", to, "=>", newTo)
-	to = newTo
-
-	wrapErr = func(err error) error {
-		return exterrors.WithFields(err, map[string]interface{}{
-			"effective_rcpt": to,
-		})
-	}
-
-	if originalTo != to {
-		dd.msgMeta.OriginalRcpts[to] = originalTo
-	}
-
-	for _, tgt := range rcptBlock.targets {
-		// Do not wrap errors coming from nested pipeline target delivery since
-		// that pipeline itself will insert effective_rcpt field and could do
-		// its own rewriting - we do not want to hide it from the admin in
-		// error messages.
-		wrapErr := wrapErr
-		if _, ok := tgt.(*MsgPipeline); ok {
-			wrapErr = func(err error) error { return err }
+	for _, to = range resultTo {
+		wrapErr := func(err error) error {
+			return exterrors.WithFields(err, map[string]interface{}{
+				"effective_rcpt": to,
+			})
 		}
 
-		delivery, err := dd.getDelivery(ctx, tgt)
+		rcptBlock, err := dd.rcptBlockForAddr(ctx, to)
 		if err != nil {
 			return wrapErr(err)
 		}
 
-		if err := delivery.AddRcpt(ctx, to); err != nil {
+		if rcptBlock.rejectErr != nil {
+			return wrapErr(rcptBlock.rejectErr)
+		}
+
+		if err := dd.checkRunner.checkRcpt(ctx, rcptBlock.checks, to); err != nil {
 			return wrapErr(err)
 		}
-		delivery.recipients = append(delivery.recipients, originalTo)
+
+		rcptModifiersState, err := dd.getRcptModifiers(ctx, rcptBlock, to)
+		if err != nil {
+			return wrapErr(err)
+		}
+
+		newTo, err = rcptModifiersState.RewriteRcpt(ctx, to)
+		if err != nil {
+			if err := rcptModifiersState.Close(); err != nil {
+				dd.log.Error("failed to close rcpt modifiers state", err)
+			}
+			return wrapErr(err)
+		}
+		dd.log.Debugln("per-rcpt modifiers:", to, "=>", newTo)
+
+		for _, to = range newTo {
+			wrapErr = func(err error) error {
+				return exterrors.WithFields(err, map[string]interface{}{
+					"effective_rcpt": to,
+				})
+			}
+
+			if originalTo != to {
+				dd.msgMeta.OriginalRcpts[to] = originalTo
+			}
+
+			for _, tgt := range rcptBlock.targets {
+				// Do not wrap errors coming from nested pipeline target delivery since
+				// that pipeline itself will insert effective_rcpt field and could do
+				// its own rewriting - we do not want to hide it from the admin in
+				// error messages.
+				wrapErr := wrapErr
+				if _, ok := tgt.(*MsgPipeline); ok {
+					wrapErr = func(err error) error { return err }
+				}
+
+				delivery, err := dd.getDelivery(ctx, tgt)
+				if err != nil {
+					return wrapErr(err)
+				}
+
+				if err := delivery.AddRcpt(ctx, to, opts); err != nil {
+					return wrapErr(err)
+				}
+				delivery.recipients = append(delivery.recipients, originalTo)
+			}
+		}
 	}
 
 	return nil
@@ -492,7 +506,7 @@ func (dd *msgpipelineDelivery) BodyNonAtomic(ctx context.Context, c module.Statu
 	}
 }
 
-func (dd msgpipelineDelivery) Commit(ctx context.Context) error {
+func (dd *msgpipelineDelivery) Commit(ctx context.Context) error {
 	dd.close()
 
 	for _, delivery := range dd.deliveries {
@@ -508,17 +522,23 @@ func (dd *msgpipelineDelivery) close() {
 	dd.checkRunner.close()
 
 	if dd.globalModifiersState != nil {
-		dd.globalModifiersState.Close()
+		if err := dd.globalModifiersState.Close(); err != nil {
+			dd.log.Error("failed to close global modifiers state", err)
+		}
 	}
 	if dd.sourceModifiersState != nil {
-		dd.sourceModifiersState.Close()
+		if err := dd.sourceModifiersState.Close(); err != nil {
+			dd.log.Error("failed to close source modifiers state", err)
+		}
 	}
 	for _, modifiers := range dd.rcptModifiersState {
-		modifiers.Close()
+		if err := modifiers.Close(); err != nil {
+			dd.log.Error("failed to close rcpt modifiers state", err)
+		}
 	}
 }
 
-func (dd msgpipelineDelivery) Abort(ctx context.Context) error {
+func (dd *msgpipelineDelivery) Abort(ctx context.Context) error {
 	dd.close()
 
 	var lastErr error
@@ -613,14 +633,14 @@ func (dd *msgpipelineDelivery) getDelivery(ctx context.Context, tgt module.Deliv
 		return delivery_, nil
 	}
 
-	deliveryObj, err := tgt.Start(ctx, dd.msgMeta, dd.sourceAddr)
+	deliveryObj, err := tgt.StartDelivery(ctx, dd.msgMeta, dd.sourceAddr)
 	if err != nil {
-		dd.log.Debugf("tgt.Start(%s) failure, target = %s: %v", dd.sourceAddr, objectName(tgt), err)
+		dd.log.Debugf("tgt.StartDelivery(%s) failure, target = %s: %v", dd.sourceAddr, objectName(tgt), err)
 		return nil, err
 	}
 	delivery_ = &delivery{Delivery: deliveryObj}
 
-	dd.log.Debugf("tgt.Start(%s) ok, target = %s", dd.sourceAddr, objectName(tgt))
+	dd.log.Debugf("tgt.StartDelivery(%s) ok, target = %s", dd.sourceAddr, objectName(tgt))
 
 	dd.deliveries[tgt] = delivery_
 	return delivery_, nil

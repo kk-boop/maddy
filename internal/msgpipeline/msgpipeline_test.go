@@ -24,8 +24,10 @@ import (
 	"testing"
 
 	"github.com/emersion/go-message/textproto"
+	"github.com/emersion/go-smtp"
 	"github.com/foxcpp/maddy/framework/buffer"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/internal/modify"
 	"github.com/foxcpp/maddy/internal/testutils"
 )
 
@@ -378,14 +380,14 @@ func TestMsgPipeline_PerSourceReject(t *testing.T) {
 
 	testutils.DoTestDelivery(t, &d, "sender1@example.com", []string{"rcpt@example.com"})
 
-	_, err := d.Start(context.Background(), &module.MsgMetadata{ID: "testing"}, "sender2@example.com")
+	_, err := d.StartDelivery(context.Background(), &module.MsgMetadata{ID: "testing"}, "sender2@example.com")
 	if err == nil {
-		t.Error("expected error for delivery.Start, got nil")
+		t.Error("expected error for delivery.StartDelivery, got nil")
 	}
 
-	_, err = d.Start(context.Background(), &module.MsgMetadata{ID: "testing"}, "sender2@example.org")
+	_, err = d.StartDelivery(context.Background(), &module.MsgMetadata{ID: "testing"}, "sender2@example.org")
 	if err == nil {
-		t.Error("expected error for delivery.Start, got nil")
+		t.Error("expected error for delivery.StartDelivery, got nil")
 	}
 }
 
@@ -411,9 +413,9 @@ func TestMsgPipeline_PerRcptReject(t *testing.T) {
 		Log: testutils.Logger(t, "msgpipeline"),
 	}
 
-	delivery, err := d.Start(context.Background(), &module.MsgMetadata{ID: "testing"}, "sender@example.com")
+	delivery, err := d.StartDelivery(context.Background(), &module.MsgMetadata{ID: "testing"}, "sender@example.com")
 	if err != nil {
-		t.Fatalf("unexpected Start err: %v", err)
+		t.Fatalf("unexpected StartDelivery err: %v", err)
 	}
 	defer func() {
 		if err := delivery.Abort(context.Background()); err != nil {
@@ -421,10 +423,10 @@ func TestMsgPipeline_PerRcptReject(t *testing.T) {
 		}
 	}()
 
-	if err := delivery.AddRcpt(context.Background(), "rcpt2@example.com"); err == nil {
+	if err := delivery.AddRcpt(context.Background(), "rcpt2@example.com", smtp.RcptOptions{}); err == nil {
 		t.Fatalf("expected error for delivery.AddRcpt(rcpt2@example.com), got nil")
 	}
-	if err := delivery.AddRcpt(context.Background(), "rcpt1@example.com"); err != nil {
+	if err := delivery.AddRcpt(context.Background(), "rcpt1@example.com", smtp.RcptOptions{}); err != nil {
 		t.Fatalf("unexpected AddRcpt err for %s: %v", "rcpt1@example.com", err)
 	}
 	if err := delivery.Body(context.Background(), textproto.Header{}, buffer.MemoryBuffer{Slice: []byte("foobar")}); err != nil {
@@ -626,7 +628,7 @@ func TestMsgPipeline_MalformedSource(t *testing.T) {
 
 	// Simple checks for violations that can make msgpipeline misbehave.
 	for _, addr := range []string{"not_postmaster_but_no_at_sign", "@no_mailbox", "no_domain@"} {
-		_, err := d.Start(context.Background(), &module.MsgMetadata{ID: "testing"}, addr)
+		_, err := d.StartDelivery(context.Background(), &module.MsgMetadata{ID: "testing"}, addr)
 		if err == nil {
 			t.Errorf("%s is accepted as valid address", addr)
 		}
@@ -658,4 +660,47 @@ func TestMsgPipeline_TwoRcptToOneTarget(t *testing.T) {
 		t.Fatalf("wrong amount of messages received for target, want %d, got %d", 1, len(target.Messages))
 	}
 	testutils.CheckTestMessage(t, &target, 0, "sender@example.com", []string{"recipient@example.com", "recipient@example.org"})
+}
+
+func TestMsgPipeline_multi_alias(t *testing.T) {
+	target1, target2 := testutils.Target{InstName: "target1"}, testutils.Target{InstName: "target2"}
+	mod := testutils.Modifier{
+		RcptTo: map[string][]string{
+			"recipient@example.com": []string{
+				"recipient-1@example.org",
+				"recipient-2@example.net",
+			},
+		},
+	}
+	d := MsgPipeline{
+		msgpipelineCfg: msgpipelineCfg{
+			perSource: map[string]sourceBlock{},
+			defaultSource: sourceBlock{
+				modifiers: modify.Group{
+					Modifiers: []module.Modifier{mod},
+				},
+				perRcpt: map[string]*rcptBlock{
+					"example.org": {
+						targets: []module.DeliveryTarget{&target1},
+					},
+					"example.net": {
+						targets: []module.DeliveryTarget{&target2},
+					},
+				},
+			},
+		},
+		Log: testutils.Logger(t, "msgpipeline"),
+	}
+
+	testutils.DoTestDelivery(t, &d, "sender@example.com", []string{"recipient@example.com"})
+
+	if len(target1.Messages) != 1 {
+		t.Errorf("wrong amount of messages received for target1, want %d, got %d", 1, len(target1.Messages))
+	}
+	testutils.CheckTestMessage(t, &target1, 0, "sender@example.com", []string{"recipient-1@example.org"})
+
+	if len(target2.Messages) != 1 {
+		t.Errorf("wrong amount of messages received for target1, want %d, got %d", 1, len(target2.Messages))
+	}
+	testutils.CheckTestMessage(t, &target2, 0, "sender@example.com", []string{"recipient-2@example.net"})
 }

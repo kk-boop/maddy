@@ -76,6 +76,7 @@ while :; do
 	shift
 done
 
+configdir="${destdir}etc/maddy"
 
 if [ "$version" = "" ]; then
 	version=unknown
@@ -104,9 +105,6 @@ build_man_pages() {
 	for f in ./docs/man/*.1.scd; do
 		scdoc < "$f" > "${builddir}/man/$(basename "$f" .scd)"
 	done
-	for f in ./docs/man/*.5.scd; do
-		scdoc < "$f" > "${builddir}/man/$(basename "$f" .scd)"
-	done
 }
 
 build() {
@@ -123,15 +121,9 @@ build() {
 		go build -trimpath -buildmode pie -tags "$tags osusergo netgo static_build" \
 			-ldflags "-extldflags '-fno-PIC -static' -X \"github.com/foxcpp/maddy.Version=${version}\"" \
 			-o "${builddir}/maddy" ${GOFLAGS} ./cmd/maddy
-		echo "-- Building management utility (maddyctl)..." >&2
-		go build -trimpath -buildmode pie -tags "$tags osusergo netgo static_build" \
-			-ldflags "-extldflags '-fno-PIC -static' -X \"github.com/foxcpp/maddy.Version=${version}\"" \
-			-o "${builddir}/maddyctl" ${GOFLAGS} ./cmd/maddyctl
 	else
 		echo "-- Building main server executable..." >&2
 		go build -tags "$tags" -trimpath -ldflags="-X \"github.com/foxcpp/maddy.Version=${version}\"" -o "${builddir}/maddy" ${GOFLAGS} ./cmd/maddy
-		echo "-- Building management utility (maddyctl)..." >&2
-		go build -tags "$tags" -trimpath -ldflags="-X \"github.com/foxcpp/maddy.Version=${version}\"" -o "${builddir}/maddyctl" ${GOFLAGS} ./cmd/maddyctl
 	fi
 
 	build_man_pages
@@ -147,26 +139,45 @@ install() {
 	echo "-- Installing built files..." >&2
 
 	command install -m 0755 -d "${destdir}/${prefix}/bin/"
-	command install -m 0755 "${builddir}/maddy" "${builddir}/maddyctl" "${destdir}/${prefix}/bin/"
-	command install -m 0755 -d "${destdir}/etc/maddy/"
-	command install -m 0644 ./maddy.conf "${destdir}/etc/maddy/maddy.conf"
+	command install -m 0755 "${builddir}/maddy" "${destdir}/${prefix}/bin/"
+	command ln -sf maddy "${destdir}/${prefix}/bin/maddyctl"
+	command install -m 0755 -d "${configdir}"
+
+
+	# We do not want to overwrite existing configuration.
+	# If the file exists, then save it with .default suffix and warn user.
+	if [ ! -e "${configdir}/maddy.conf" ]; then
+		command install -m 0644 ./maddy.conf "${configdir}/maddy.conf"
+	else
+		echo "-- [!] Configuration file ${configdir}/maddy.conf exists, saving to ${configdir}/maddy.conf.default" >&2
+		command install -m 0644 ./maddy.conf "${configdir}/maddy.conf.default"
+	fi
 
 	# Attempt to install systemd units only for Linux.
 	# Check is done using GOOS instead of uname -s to account for possible
 	# package cross-compilation.
-	if [ "$(go env GOOS)" = "linux" ]; then
-		command install -m 0755 -d "${destdir}/${prefix}/lib/systemd/system/"
-		command install -m 0644 "${builddir}"/systemd/*.service "${destdir}/${prefix}/lib/systemd/system/"
+	# Though go command might be unavailable if build.sh is run
+	# with sudo and go installation is user-specific, so fallback
+	# to using uname -s in the end.
+	set +e
+	if command -v go >/dev/null 2>/dev/null; then
+		set -e
+		if [ "$(go env GOOS)" = "linux" ]; then
+			command install -m 0755 -d "${destdir}/${prefix}/lib/systemd/system/"
+			command install -m 0644 "${builddir}"/systemd/*.service "${destdir}/${prefix}/lib/systemd/system/"
+		fi
+	else
+		set -e
+		if [ "$(uname -s)" = "Linux" ]; then
+			command install -m 0755 -d "${destdir}/${prefix}/lib/systemd/system/"
+			command install -m 0644 "${builddir}"/systemd/*.service "${destdir}/${prefix}/lib/systemd/system/"
+		fi
 	fi
 
 	if [ -e "${builddir}"/man ]; then
 		command install -m 0755 -d "${destdir}/${prefix}/share/man/man1/"
 		for f in "${builddir}"/man/*.1; do
 			command install -m 0644 "$f" "${destdir}/${prefix}/share/man/man1/"
-		done
-		command install -m 0755 -d "${destdir}/${prefix}/share/man/man5/"
-		for f in "${builddir}"/man/*.5; do
-			command install -m 0644 "$f" "${destdir}/${prefix}/share/man/man5/"
 		done
 	fi
 }

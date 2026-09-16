@@ -29,9 +29,10 @@ import (
 	"time"
 
 	"github.com/foxcpp/maddy/framework/config"
-	"github.com/foxcpp/maddy/framework/hooks"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 const FileModName = "table.file"
@@ -47,24 +48,16 @@ type File struct {
 	stopReloader chan struct{}
 	forceReload  chan struct{}
 
-	log log.Logger
+	log *log.Logger
 }
 
-func NewFile(_, instName string, _, inlineArgs []string) (module.Module, error) {
+func NewFile(c *container.C, modName, instName string) (module.Module, error) {
 	m := &File{
 		instName:     instName,
 		m:            make(map[string][]string),
 		stopReloader: make(chan struct{}),
 		forceReload:  make(chan struct{}),
-		log:          log.Logger{Name: FileModName},
-	}
-
-	switch len(inlineArgs) {
-	case 1:
-		m.file = inlineArgs[0]
-	case 0:
-	default:
-		return nil, fmt.Errorf("%s: cannot use multiple files with single %s, use %s multiple times to do so", FileModName, FileModName, FileModName)
+		log:          c.DefaultLogger.Sublogger(modName),
 	}
 
 	return m, nil
@@ -78,7 +71,15 @@ func (f *File) InstanceName() string {
 	return f.instName
 }
 
-func (f *File) Init(cfg *config.Map) error {
+func (f *File) Configure(inlineArgs []string, cfg *config.Map) error {
+	switch len(inlineArgs) {
+	case 1:
+		f.file = inlineArgs[0]
+	case 0:
+	default:
+		return fmt.Errorf("%s: cannot use multiple files with single %s, use %s multiple times to do so", FileModName, FileModName, FileModName)
+	}
+
 	var file string
 	cfg.Bool("debug", true, false, &f.log.Debug)
 	cfg.String("file", false, false, "", &file)
@@ -100,11 +101,22 @@ func (f *File) Init(cfg *config.Map) error {
 		f.log.Printf("ignoring non-existent file: %s", f.file)
 	}
 
-	go f.reloader()
-	hooks.AddHook(hooks.EventReload, func() {
-		f.forceReload <- struct{}{}
-	})
+	return nil
+}
 
+func (f *File) Start() error {
+	go f.reloader()
+	return nil
+}
+
+func (f *File) Reload() error {
+	f.forceReload <- struct{}{}
+	return nil
+}
+
+func (f *File) Stop() error {
+	f.stopReloader <- struct{}{}
+	<-f.stopReloader
 	return nil
 }
 
@@ -119,55 +131,66 @@ func (f *File) reloader() {
 	}()
 
 	t := time.NewTicker(reloadInterval)
+	defer t.Stop()
 
 	for {
 		select {
 		case <-t.C:
-			var latestStamp time.Time
-			info, err := os.Stat(f.file)
-			if err != nil {
-				if os.IsNotExist(err) {
-					f.mLck.Lock()
-					f.m = map[string][]string{}
-					f.mStamp = time.Now()
-					f.mLck.Unlock()
-					continue
-				}
-				f.log.Printf("%v", err)
-			}
-			if info.ModTime().After(latestStamp) {
-				latestStamp = info.ModTime()
-			}
+			f.reload()
+
 		case <-f.forceReload:
+			f.reload()
+
 		case <-f.stopReloader:
 			f.stopReloader <- struct{}{}
 			return
 		}
-
-		f.log.Debugf("reloading")
-
-		newm := make(map[string][]string, len(f.m)+5)
-		if err := readFile(f.file, newm); err != nil {
-			if os.IsNotExist(err) {
-				f.log.Printf("ignoring non-existent file: %s", f.file)
-				continue
-			}
-
-			f.log.Println(err)
-			continue
-		}
-
-		f.mLck.Lock()
-		f.m = newm
-		f.mStamp = time.Now()
-		f.mLck.Unlock()
 	}
 }
 
-func (f *File) Close() error {
-	f.stopReloader <- struct{}{}
-	<-f.stopReloader
-	return nil
+func (f *File) reload() {
+	info, err := os.Stat(f.file)
+	if err != nil {
+		if os.IsNotExist(err) {
+			f.mLck.Lock()
+			f.m = map[string][]string{}
+			f.mLck.Unlock()
+			return
+		}
+		f.log.Error("os stat", err)
+	}
+	if info.ModTime().Before(f.mStamp) || time.Since(info.ModTime()) < (reloadInterval/2) {
+		return // reload not necessary
+	}
+
+	f.log.Debugf("reloading")
+
+	newm := make(map[string][]string, len(f.m)+5)
+	if err := readFile(f.file, newm); err != nil {
+		if os.IsNotExist(err) {
+			f.log.Printf("ignoring non-existent file: %s", f.file)
+			return
+		}
+
+		f.log.Println(err)
+		return
+	}
+	// after reading we need to check whether file has changed in between
+	info2, err := os.Stat(f.file)
+	if err != nil {
+		f.log.Println(err)
+		return
+	}
+
+	if !info2.ModTime().Equal(info.ModTime()) {
+		// file has changed in the meantime
+		return
+	}
+
+	f.mLck.Lock()
+	f.m = newm
+	f.mStamp = info.ModTime()
+	f.mLck.Unlock()
 }
 
 func readFile(path string, out map[string][]string) error {
@@ -203,9 +226,11 @@ func readFile(path string, out map[string][]string) error {
 		if len(from) == 0 {
 			return parseErr("empty address before colon")
 		}
-		to := strings.TrimSpace(parts[1])
 
-		out[from] = append(out[from], to)
+		for _, to := range strings.Split(parts[1], ",") {
+			to := strings.TrimSpace(to)
+			out[from] = append(out[from], to)
+		}
 	}
 	return scnr.Err()
 }
@@ -235,5 +260,5 @@ func (f *File) LookupMulti(_ context.Context, val string) ([]string, error) {
 }
 
 func init() {
-	module.Register(FileModName, NewFile)
+	modules.Register(FileModName, NewFile)
 }

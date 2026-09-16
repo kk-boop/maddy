@@ -7,17 +7,27 @@ import (
 	"net/http"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 const modName = "storage.blob.s3"
 
+const (
+	credsTypeFileMinio = "file_minio"
+	credsTypeFileAWS   = "file_aws"
+	credsTypeAccessKey = "access_key"
+	credsTypeIAM       = "iam"
+	credsTypeDefault   = credsTypeAccessKey
+)
+
 type Store struct {
 	instName string
-	log      log.Logger
+	log      *log.Logger
 
 	endpoint string
 	cl       *minio.Client
@@ -26,22 +36,23 @@ type Store struct {
 	objectPrefix string
 }
 
-func New(_, instName string, _, inlineArgs []string) (module.Module, error) {
-	if len(inlineArgs) != 0 {
-		return nil, fmt.Errorf("%s: expected 0 arguments", modName)
-	}
-
+func New(c *container.C, modName, instName string) (module.Module, error) {
 	return &Store{
 		instName: instName,
-		log:      log.Logger{Name: modName},
+		log:      c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
-func (s *Store) Init(cfg *config.Map) error {
+func (s *Store) Configure(inlineArgs []string, cfg *config.Map) error {
+	if len(inlineArgs) != 0 {
+		return fmt.Errorf("%s: expected 0 arguments", modName)
+	}
+
 	var (
 		secure          bool
 		accessKeyID     string
 		secretAccessKey string
+		credsType       string
 		location        string
 	)
 	cfg.String("endpoint", false, true, "", &s.endpoint)
@@ -51,6 +62,7 @@ func (s *Store) Init(cfg *config.Map) error {
 	cfg.String("bucket", false, true, "", &s.bucketName)
 	cfg.String("region", false, false, "", &location)
 	cfg.String("object_prefix", false, false, "", &s.objectPrefix)
+	cfg.String("creds", false, false, credsTypeDefault, &credsType)
 
 	if _, err := cfg.Process(); err != nil {
 		return err
@@ -59,8 +71,23 @@ func (s *Store) Init(cfg *config.Map) error {
 		return fmt.Errorf("%s: endpoint not set", modName)
 	}
 
+	var creds *credentials.Credentials
+
+	switch credsType {
+	case credsTypeFileMinio:
+		creds = credentials.NewFileMinioClient("", "")
+	case credsTypeFileAWS:
+		creds = credentials.NewFileAWSCredentials("", "")
+	case credsTypeIAM:
+		creds = credentials.NewIAM("")
+	case credsTypeAccessKey:
+		creds = credentials.NewStaticV4(accessKeyID, secretAccessKey, "")
+	default:
+		creds = credentials.NewStaticV4(accessKeyID, secretAccessKey, "")
+	}
+
 	cl, err := minio.New(s.endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKeyID, secretAccessKey, ""),
+		Creds:  creds,
 		Secure: secure,
 		Region: location,
 	})
@@ -95,7 +122,9 @@ func (b *s3blob) Sync() error {
 		panic("storage.blob.s3: Sync called twice for a blob object")
 	}
 
-	b.pw.Close()
+	if err := b.pw.Close(); err != nil {
+		return err
+	}
 	b.didSync = true
 	return <-b.errCh
 }
@@ -167,5 +196,5 @@ func (s *Store) Delete(ctx context.Context, keys []string) error {
 
 func init() {
 	var _ module.BlobStore = &Store{}
-	module.Register(modName, New)
+	modules.Register(modName, New)
 }

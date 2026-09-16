@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package imap
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -27,12 +28,8 @@ import (
 	"sync"
 
 	"github.com/emersion/go-imap"
-	appendlimit "github.com/emersion/go-imap-appendlimit"
 	compress "github.com/emersion/go-imap-compress"
-	move "github.com/emersion/go-imap-move"
 	sortthread "github.com/emersion/go-imap-sortthread"
-	specialuse "github.com/emersion/go-imap-specialuse"
-	unselect "github.com/emersion/go-imap-unselect"
 	imapbackend "github.com/emersion/go-imap/backend"
 	imapserver "github.com/emersion/go-imap/server"
 	"github.com/emersion/go-message"
@@ -40,44 +37,53 @@ import (
 	"github.com/emersion/go-sasl"
 	i18nlevel "github.com/foxcpp/go-imap-i18nlevel"
 	namespace "github.com/foxcpp/go-imap-namespace"
-	"github.com/foxcpp/go-imap-sql/children"
 	"github.com/foxcpp/maddy/framework/config"
 	modconfig "github.com/foxcpp/maddy/framework/config/module"
 	tls2 "github.com/foxcpp/maddy/framework/config/tls"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
+	"github.com/foxcpp/maddy/framework/resource/netresource"
 	"github.com/foxcpp/maddy/internal/auth"
+	"github.com/foxcpp/maddy/internal/authz"
+	"github.com/foxcpp/maddy/internal/proxy_protocol"
 	"github.com/foxcpp/maddy/internal/updatepipe"
 )
 
 type Endpoint struct {
-	addrs     []string
-	serv      *imapserver.Server
-	listeners []net.Listener
-	Store     module.Storage
+	addrs         []string
+	serv          *imapserver.Server
+	proxyProtocol *proxy_protocol.ProxyProtocol
+	Store         module.Storage
+	tlsConfig     *tls.Config
 
-	updater     imapbackend.BackendUpdater
-	tlsConfig   *tls.Config
+	endpoints   []config.Endpoint
+	listeners   []net.Listener
 	listenersWg sync.WaitGroup
 
 	saslAuth auth.SASLAuth
 
-	Log log.Logger
+	storageNormalize authz.NormalizeFunc
+	storageMap       module.Table
+
+	log *log.Logger
 }
 
-func New(modName string, addrs []string) (module.Module, error) {
+func New(c *container.C, modName string, addrs []string) (container.LifetimeModule, error) {
+	logger := c.DefaultLogger.Sublogger(modName)
 	endp := &Endpoint{
 		addrs: addrs,
-		Log:   log.Logger{Name: modName},
+		log:   logger,
 		saslAuth: auth.SASLAuth{
-			Log: log.Logger{Name: modName + "/sasl"},
+			Log: logger.Sublogger("sasl"),
 		},
 	}
 
 	return endp, nil
 }
 
-func (endp *Endpoint) Init(cfg *config.Map) error {
+func (endp *Endpoint) Configure(_ []string, cfg *config.Map) error {
 	var (
 		insecureAuth bool
 		ioDebug      bool
@@ -87,33 +93,25 @@ func (endp *Endpoint) Init(cfg *config.Map) error {
 	cfg.Callback("auth", func(m *config.Map, node config.Node) error {
 		return endp.saslAuth.AddProvider(m, node)
 	})
+	cfg.Bool("sasl_login", false, false, &endp.saslAuth.EnableLogin)
 	cfg.Custom("storage", false, true, nil, modconfig.StorageDirective, &endp.Store)
 	cfg.Custom("tls", true, true, nil, tls2.TLSDirective, &endp.tlsConfig)
+	cfg.Custom("proxy_protocol", false, false, nil, proxy_protocol.ProxyProtocolDirective, &endp.proxyProtocol)
 	cfg.Bool("insecure_auth", false, false, &insecureAuth)
 	cfg.Bool("io_debug", false, false, &ioDebug)
 	cfg.Bool("io_errors", false, false, &ioErrors)
-	cfg.Bool("debug", true, false, &endp.Log.Debug)
+	cfg.Bool("debug", true, false, &endp.log.Debug)
+	config.EnumMapped(cfg, "storage_map_normalize", false, false, authz.NormalizeFuncs, authz.NormalizeAuto,
+		&endp.storageNormalize)
+	modconfig.Table(cfg, "storage_map", false, false, nil, &endp.storageMap)
+	config.EnumMapped(cfg, "auth_map_normalize", true, false, authz.NormalizeFuncs, authz.NormalizeAuto,
+		&endp.saslAuth.AuthNormalize)
+	modconfig.Table(cfg, "auth_map", true, false, nil, &endp.saslAuth.AuthMap)
 	if _, err := cfg.Process(); err != nil {
 		return err
 	}
 
-	var ok bool
-	endp.updater, ok = endp.Store.(imapbackend.BackendUpdater)
-	if !ok {
-		return fmt.Errorf("imap: storage module %T does not implement imapbackend.BackendUpdater", endp.Store)
-	}
-
-	if updBe, ok := endp.Store.(updatepipe.Backend); ok {
-		if err := updBe.EnableUpdatePipe(updatepipe.ModeReplicate); err != nil {
-			endp.Log.Error("failed to initialize updates pipe", err)
-		}
-	}
-
-	// Call Updates once at start, some storage backends initialize update
-	// channel lazily and may not generate updates at all unless it is called.
-	if endp.updater.Updates() == nil {
-		return fmt.Errorf("imap: failed to init backend: nil update channel")
-	}
+	endp.saslAuth.Log.Debug = endp.log.Debug
 
 	addresses := make([]config.Endpoint, 0, len(endp.addrs))
 	for _, addr := range endp.addrs {
@@ -121,20 +119,24 @@ func (endp *Endpoint) Init(cfg *config.Map) error {
 		if err != nil {
 			return fmt.Errorf("imap: invalid address: %s", addr)
 		}
+		if saddr.IsTLS() && endp.tlsConfig == nil {
+			return errors.New("imap: can't bind on IMAPS endpoint without TLS configuration")
+		}
 		addresses = append(addresses, saddr)
 	}
+	endp.endpoints = addresses
 
 	endp.serv = imapserver.New(endp)
 	endp.serv.AllowInsecureAuth = insecureAuth
 	endp.serv.TLSConfig = endp.tlsConfig
 	if ioErrors {
-		endp.serv.ErrorLog = &endp.Log
+		endp.serv.ErrorLog = endp.log
 	} else {
-		endp.serv.ErrorLog = log.Logger{Out: log.NopOutput{}}
+		endp.serv.ErrorLog = &log.NopLogger
 	}
 	if ioDebug {
-		endp.serv.Debug = endp.Log.DebugWriter()
-		endp.Log.Println("I/O debugging is on! It may leak passwords in logs, be careful!")
+		endp.serv.Debug = endp.log.DebugWriter()
+		endp.log.Println("I/O debugging is on! It may leak passwords in logs, be careful!")
 	}
 
 	if err := endp.enableExtensions(); err != nil {
@@ -142,26 +144,49 @@ func (endp *Endpoint) Init(cfg *config.Map) error {
 	}
 
 	for _, mech := range endp.saslAuth.SASLMechanisms() {
-		mech := mech
 		endp.serv.EnableAuth(mech, func(c imapserver.Conn) sasl.Server {
-			return endp.saslAuth.CreateSASL(mech, c.Info().RemoteAddr, func(identity string) error {
+			return endp.saslAuth.CreateSASL(mech, c.Info().RemoteAddr, func(identity string, data auth.ContextData) error {
 				return endp.openAccount(c, identity)
 			})
 		})
 	}
 
-	return endp.setupListeners(addresses)
+	if endp.serv.AllowInsecureAuth {
+		endp.log.Println("authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!")
+	}
+	if endp.serv.TLSConfig == nil {
+		endp.log.Println("TLS is disabled, this is insecure configuration and should be used only for testing!")
+		endp.serv.AllowInsecureAuth = true
+	}
+
+	return nil
+}
+
+func (endp *Endpoint) Start() error {
+	if updBe, ok := endp.Store.(updatepipe.Backend); ok {
+		if err := updBe.EnableUpdatePipe(updatepipe.ModeReplicate); err != nil {
+			endp.log.Error("failed to initialize updates pipe", err)
+		}
+	}
+
+	if err := endp.setupListeners(endp.endpoints); err != nil {
+		if err := endp.Stop(); err != nil {
+			endp.log.Error("failed to stop after setupListeners error", err)
+		}
+		return err
+	}
+	return nil
 }
 
 func (endp *Endpoint) setupListeners(addresses []config.Endpoint) error {
 	for _, addr := range addresses {
 		var l net.Listener
 		var err error
-		l, err = net.Listen(addr.Network(), addr.Address())
+		l, err = netresource.Listen(addr.Network(), addr.Address())
 		if err != nil {
 			return fmt.Errorf("imap: %v", err)
 		}
-		endp.Log.Printf("listening on %v", addr)
+		endp.log.Printf("listening on %v", addr)
 
 		if addr.IsTLS() {
 			if endp.tlsConfig == nil {
@@ -170,31 +195,21 @@ func (endp *Endpoint) setupListeners(addresses []config.Endpoint) error {
 			l = tls.NewListener(l, endp.tlsConfig)
 		}
 
-		endp.listeners = append(endp.listeners, l)
+		if endp.proxyProtocol != nil {
+			l = proxy_protocol.NewListener(l, endp.proxyProtocol, endp.log)
+		}
 
+		endp.listeners = append(endp.listeners, l)
 		endp.listenersWg.Add(1)
-		addr := addr
 		go func() {
+			defer endp.listenersWg.Done()
 			if err := endp.serv.Serve(l); err != nil && !strings.HasSuffix(err.Error(), "use of closed network connection") {
-				endp.Log.Printf("imap: failed to serve %s: %s", addr, err)
+				endp.log.Printf("imap: failed to serve %s: %s", addr, err)
 			}
-			endp.listenersWg.Done()
 		}()
 	}
 
-	if endp.serv.AllowInsecureAuth {
-		endp.Log.Println("authentication over unencrypted connections is allowed, this is insecure configuration and should be used only for testing!")
-	}
-	if endp.serv.TLSConfig == nil {
-		endp.Log.Println("TLS is disabled, this is insecure configuration and should be used only for testing!")
-		endp.serv.AllowInsecureAuth = true
-	}
-
 	return nil
-}
-
-func (endp *Endpoint) Updates() <-chan imapbackend.Update {
-	return endp.updater.Updates()
 }
 
 func (endp *Endpoint) Name() string {
@@ -205,9 +220,11 @@ func (endp *Endpoint) InstanceName() string {
 	return "imap"
 }
 
-func (endp *Endpoint) Close() error {
+func (endp *Endpoint) Stop() error {
 	for _, l := range endp.listeners {
-		l.Close()
+		if err := l.Close(); err != nil {
+			endp.log.Error("failed to close listener", err)
+		}
 	}
 	if err := endp.serv.Close(); err != nil {
 		return err
@@ -216,8 +233,42 @@ func (endp *Endpoint) Close() error {
 	return nil
 }
 
+func (endp *Endpoint) usernameForStorage(ctx context.Context, saslUsername string) (string, error) {
+	saslUsername, err := endp.storageNormalize(saslUsername)
+	if err != nil {
+		return "", err
+	}
+
+	if endp.storageMap == nil {
+		return saslUsername, nil
+	}
+
+	mapped, ok, err := endp.storageMap.Lookup(ctx, saslUsername)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", imapbackend.ErrInvalidCredentials
+	}
+
+	if saslUsername != mapped {
+		endp.log.DebugMsg("using mapped username for storage", "username", saslUsername, "mapped_username", mapped)
+	}
+
+	return mapped, nil
+}
+
 func (endp *Endpoint) openAccount(c imapserver.Conn, identity string) error {
-	u, err := endp.Store.GetOrCreateIMAPAcct(identity)
+	username, err := endp.usernameForStorage(context.TODO(), identity)
+	if err != nil {
+		if errors.Is(err, imapbackend.ErrInvalidCredentials) {
+			return err
+		}
+		endp.log.Error("failed to determine storage account name", err, "username", username)
+		return fmt.Errorf("internal server error")
+	}
+
+	u, err := endp.Store.GetOrCreateIMAPAcct(username)
 	if err != nil {
 		return err
 	}
@@ -228,17 +279,23 @@ func (endp *Endpoint) openAccount(c imapserver.Conn, identity string) error {
 }
 
 func (endp *Endpoint) Login(connInfo *imap.ConnInfo, username, password string) (imapbackend.User, error) {
+	// saslAuth handles AuthMap calling.
 	err := endp.saslAuth.AuthPlain(username, password)
 	if err != nil {
-		endp.Log.Error("authentication failed", err, "username", username, "src_ip", connInfo.RemoteAddr)
+		endp.log.Error("authentication failed", err, "username", username, "src_ip", connInfo.RemoteAddr)
 		return nil, imapbackend.ErrInvalidCredentials
 	}
 
-	return endp.Store.GetOrCreateIMAPAcct(username)
-}
+	storageUsername, err := endp.usernameForStorage(context.TODO(), username)
+	if err != nil {
+		if errors.Is(err, imapbackend.ErrInvalidCredentials) {
+			return nil, err
+		}
+		endp.log.Error("authentication failed due to an internal error", err, "username", username, "src_ip", connInfo.RemoteAddr)
+		return nil, fmt.Errorf("internal server error")
+	}
 
-func (endp *Endpoint) EnableChildrenExt() bool {
-	return endp.Store.(children.Backend).EnableChildrenExt()
+	return endp.Store.GetOrCreateIMAPAcct(storageUsername)
 }
 
 func (endp *Endpoint) I18NLevel() int {
@@ -253,14 +310,6 @@ func (endp *Endpoint) enableExtensions() error {
 	exts := endp.Store.IMAPExtensions()
 	for _, ext := range exts {
 		switch ext {
-		case "APPENDLIMIT":
-			endp.serv.Enable(appendlimit.NewExtension())
-		case "CHILDREN":
-			endp.serv.Enable(children.NewExtension())
-		case "MOVE":
-			endp.serv.Enable(move.NewExtension())
-		case "SPECIAL-USE":
-			endp.serv.Enable(specialuse.NewExtension())
 		case "I18NLEVEL=1", "I18NLEVEL=2":
 			endp.serv.Enable(i18nlevel.NewExtension())
 		case "SORT":
@@ -272,7 +321,6 @@ func (endp *Endpoint) enableExtensions() error {
 	}
 
 	endp.serv.Enable(compress.NewExtension())
-	endp.serv.Enable(unselect.NewExtension())
 	endp.serv.Enable(namespace.NewExtension())
 
 	return nil
@@ -288,7 +336,7 @@ func (endp *Endpoint) SupportedThreadAlgorithms() []sortthread.ThreadAlgorithm {
 }
 
 func init() {
-	module.RegisterEndpoint("imap", New)
+	modules.RegisterEndpoint("imap", New)
 
 	imap.CharsetReader = message.CharsetReader
 }

@@ -21,35 +21,37 @@ package openmetrics
 import (
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"sync"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
-	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
+	"github.com/foxcpp/maddy/framework/resource/netresource"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const modName = "openmetrics"
 
 type Endpoint struct {
-	addrs  []string
-	logger log.Logger
+	addrs     []string
+	endpoints []config.Endpoint
+	logger    *log.Logger
 
 	listenersWg sync.WaitGroup
 	serv        http.Server
 	mux         *http.ServeMux
 }
 
-func New(_ string, args []string) (module.Module, error) {
+func New(c *container.C, _ string, args []string) (container.LifetimeModule, error) {
 	return &Endpoint{
 		addrs:  args,
-		logger: log.Logger{Name: modName, Debug: log.DefaultLogger.Debug},
+		logger: c.DefaultLogger.Sublogger(modName),
 	}, nil
 }
 
-func (e *Endpoint) Init(cfg *config.Map) error {
+func (e *Endpoint) Configure(inlineArgs []string, cfg *config.Map) error {
 	cfg.Bool("debug", false, false, &e.logger.Debug)
 	if _, err := cfg.Process(); err != nil {
 		return err
@@ -60,7 +62,6 @@ func (e *Endpoint) Init(cfg *config.Map) error {
 	e.serv.Handler = e.mux
 
 	for _, a := range e.addrs {
-		a := a
 		endp, err := config.ParseEndpoint(a)
 		if err != nil {
 			return fmt.Errorf("%s: malformed endpoint: %v", modName, err)
@@ -68,19 +69,7 @@ func (e *Endpoint) Init(cfg *config.Map) error {
 		if endp.IsTLS() {
 			return fmt.Errorf("%s: TLS is not supported yet", modName)
 		}
-		l, err := net.Listen(endp.Network(), endp.Address())
-		if err != nil {
-			return fmt.Errorf("%s: %v", modName, err)
-		}
-
-		e.listenersWg.Add(1)
-		go func() {
-			e.logger.Println("listening on", endp.String())
-			err := e.serv.Serve(l)
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				e.logger.Error("serve failed", err, "endpoint", a)
-			}
-		}()
+		e.endpoints = append(e.endpoints, endp)
 	}
 
 	return nil
@@ -94,7 +83,30 @@ func (e *Endpoint) InstanceName() string {
 	return ""
 }
 
-func (e *Endpoint) Close() error {
+func (e *Endpoint) Start() error {
+	for _, endp := range e.endpoints {
+		l, err := netresource.Listen(endp.Network(), endp.Address())
+		if err != nil {
+			if err := e.Stop(); err != nil {
+				e.logger.Error("failed to stop after failed listen", err)
+			}
+			return fmt.Errorf("%s: %v", modName, err)
+		}
+
+		e.listenersWg.Add(1)
+		go func() {
+			e.logger.Println("listening on", endp.String())
+			err := e.serv.Serve(l)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				e.logger.Error("serve failed", err, "endpoint", endp)
+			}
+			e.listenersWg.Done()
+		}()
+	}
+	return nil
+}
+
+func (e *Endpoint) Stop() error {
 	if err := e.serv.Close(); err != nil {
 		return err
 	}
@@ -103,5 +115,5 @@ func (e *Endpoint) Close() error {
 }
 
 func init() {
-	module.RegisterEndpoint(modName, New)
+	modules.RegisterEndpoint(modName, New)
 }

@@ -21,10 +21,11 @@ package remote
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
+	"errors"
 	"net"
 	"runtime/trace"
 	"sort"
+	"time"
 
 	"github.com/foxcpp/maddy/framework/config"
 	"github.com/foxcpp/maddy/framework/dns"
@@ -44,9 +45,11 @@ type mxConn struct {
 	errored bool
 
 	reuseLimit int
+	takeDest   bool
 
 	// Amount of times connection was used for an SMTP transaction.
 	transactions int
+	lastUseAt    time.Time
 
 	// MX/TLS security level established for this connection.
 	mxLevel  module.MXLevel
@@ -54,10 +57,14 @@ type mxConn struct {
 }
 
 func (c *mxConn) Usable() bool {
-	if c.C == nil || c.transactions > c.reuseLimit || c.C.Client() == nil {
+	if c.C == nil || c.transactions > c.reuseLimit || c.Client() == nil || c.errored {
 		return false
 	}
 	return c.C.Client().Reset() == nil
+}
+
+func (c *mxConn) LastUseAt() time.Time {
+	return c.lastUseAt
 }
 
 func (c *mxConn) Close() error {
@@ -65,20 +72,8 @@ func (c *mxConn) Close() error {
 }
 
 func isVerifyError(err error) bool {
-	_, ok := err.(x509.UnknownAuthorityError)
-	if ok {
-		return true
-	}
-	_, ok = err.(x509.HostnameError)
-	if ok {
-		return true
-	}
-	_, ok = err.(x509.ConstraintViolationError)
-	if ok {
-		return true
-	}
-	_, ok = err.(x509.CertificateInvalidError)
-	return ok
+	var e *tls.CertificateVerificationError
+	return errors.As(err, &e)
 }
 
 // connect attempts to connect to the MX, first trying STARTTLS with X.509
@@ -95,7 +90,7 @@ func (rd *remoteDelivery) connect(ctx context.Context, conn mxConn, host string,
 		tlsCfg.ServerName = host
 	}
 
-	rd.Log.DebugMsg("trying", "remote_server", host, "domain", conn.domain)
+	rd.log.DebugMsg("trying", "remote_server", host, "domain", conn.domain)
 
 retry:
 	// smtpconn.C default TLS behavior is not useful for us, we want to handle
@@ -111,6 +106,18 @@ retry:
 	starttlsOk, _ := conn.Client().Extension("STARTTLS")
 	if starttlsOk && tlsCfg != nil {
 		if err := conn.Client().StartTLS(tlsCfg); err != nil {
+			// Here we just issue STARTTLS command. If it fails for some
+			// reason - this is either a connection problem or server actively
+			// rejecting STARTTLS (despite advertising STARTTLS).
+			// We err on the caution side here and do not perform any fallbacks.
+			if err := conn.DirectClose(); err != nil {
+				rd.log.Error("conn.DirectClose failed", err)
+			}
+			return module.TLSNone, nil, err
+		}
+
+		// TLS handshake is deferred to here, this is where we check errors and allow fallback.
+		if err := conn.Client().Hello(rd.rt.hostname); err != nil {
 			tlsErr = err
 
 			// Attempt TLS without authentication. It is still better than
@@ -121,21 +128,25 @@ retry:
 			// error happens with InsecureSkipVerify too (e.g. certificate is
 			// *too* broken).
 			if isVerifyError(err) && tlsLevel == module.TLSAuthenticated {
-				rd.Log.Error("TLS verify error, trying without authentication", err, "remote_server", host, "domain", conn.domain)
+				rd.log.Error("TLS verify error, trying without authentication", err, "remote_server", host, "domain", conn.domain)
 				tlsCfg.InsecureSkipVerify = true
 				tlsLevel = module.TLSEncrypted
 
 				// TODO: Check go-smtp code to make TLS verification errors
 				// non-sticky so we can properly send QUIT in this case.
-				conn.DirectClose()
+				if err := conn.DirectClose(); err != nil {
+					rd.log.Error("conn.DirectClose failed", err)
+				}
 
 				goto retry
 			}
 
-			rd.Log.Error("TLS error, trying plaintext", err, "remote_server", host, "domain", conn.domain)
+			rd.log.Error("TLS error, trying plaintext", err, "remote_server", host, "domain", conn.domain)
 			tlsCfg = nil
 			tlsLevel = module.TLSNone
-			conn.DirectClose()
+			if err := conn.DirectClose(); err != nil {
+				rd.log.Error("conn.DirectClose failed", err)
+			}
 
 			goto retry
 		}
@@ -179,7 +190,7 @@ func (rd *remoteDelivery) attemptMX(ctx context.Context, conn *mxConn, record *n
 	for _, p := range rd.policies {
 		policyLevel, err := p.CheckConn(connCtx, mxLevel, tlsLevel, conn.domain, record.Host, tlsState)
 		if err != nil {
-			conn.Close()
+			rd.closeConn(conn)
 			return exterrors.WithFields(err, map[string]interface{}{"tls_err": tlsErr})
 		}
 		if policyLevel > tlsLevel {
@@ -196,9 +207,19 @@ func (rd *remoteDelivery) attemptMX(ctx context.Context, conn *mxConn, record *n
 	return nil
 }
 
-func (rd *remoteDelivery) connectionForDomain(ctx context.Context, domain string) (*smtpconn.C, error) {
+func (rd *remoteDelivery) closeConn(c *mxConn) {
+	if c.takeDest {
+		rd.rt.limits.ReleaseDest(c.domain)
+	}
+
+	if err := c.Close(); err != nil {
+		rd.log.Error("client connection close failed", err)
+	}
+}
+
+func (rd *remoteDelivery) connectionForDomain(ctx context.Context, domain string) (*mxConn, error) {
 	if c, ok := rd.connections[domain]; ok {
-		return c.C, nil
+		return c, nil
 	}
 
 	pooledConn, err := rd.rt.pool.Get(ctx, domain)
@@ -212,9 +233,10 @@ func (rd *remoteDelivery) connectionForDomain(ctx context.Context, domain string
 	// connection with weaker security.
 	if pooledConn != nil && !rd.msgMeta.SMTPOpts.RequireTLS {
 		conn = pooledConn.(*mxConn)
-		rd.Log.Msg("reusing cached connection", "domain", domain, "transactions_counter", conn.transactions)
+		rd.log.Msg("reusing cached connection", "domain", domain, "transactions_counter", conn.transactions,
+			"local_addr", conn.LocalAddr(), "remote_addr", conn.RemoteAddr())
 	} else {
-		rd.Log.DebugMsg("opening new connection", "domain", domain, "cache_ignored", pooledConn != nil)
+		rd.log.DebugMsg("opening new connection", "domain", domain, "cache_ignored", pooledConn != nil)
 		conn, err = rd.newConn(ctx, domain)
 		if err != nil {
 			return nil, err
@@ -223,7 +245,7 @@ func (rd *remoteDelivery) connectionForDomain(ctx context.Context, domain string
 
 	if rd.msgMeta.SMTPOpts.RequireTLS {
 		if conn.tlsLevel < module.TLSAuthenticated {
-			conn.Close()
+			rd.closeConn(conn)
 			return nil, &exterrors.SMTPError{
 				Code:         550,
 				EnhancedCode: exterrors.EnhancedCode{5, 7, 30},
@@ -234,11 +256,11 @@ func (rd *remoteDelivery) connectionForDomain(ctx context.Context, domain string
 			}
 		}
 		if conn.mxLevel < module.MX_MTASTS {
-			conn.Close()
+			rd.closeConn(conn)
 			return nil, &exterrors.SMTPError{
 				Code:         550,
 				EnhancedCode: exterrors.EnhancedCode{5, 7, 30},
-				Message:      "Failed to estabilish the MX record authenticity (REQUIRETLS)",
+				Message:      "Failed to establish the MX record authenticity (REQUIRETLS)",
 				Misc: map[string]interface{}{
 					"mx_level": conn.mxLevel,
 				},
@@ -249,9 +271,11 @@ func (rd *remoteDelivery) connectionForDomain(ctx context.Context, domain string
 	region := trace.StartRegion(ctx, "remote/limits.TakeDest")
 	if err := rd.rt.limits.TakeDest(ctx, domain); err != nil {
 		region.End()
+		rd.closeConn(conn)
 		return nil, err
 	}
 	region.End()
+	conn.takeDest = true
 
 	// Relaxed REQUIRETLS mode is not conforming to the specification strictly
 	// but allows to start deploying client support for REQUIRETLS without the
@@ -266,12 +290,13 @@ func (rd *remoteDelivery) connectionForDomain(ctx context.Context, domain string
 	}
 
 	if err := conn.Mail(ctx, rd.mailFrom, rd.msgMeta.SMTPOpts); err != nil {
-		conn.Close()
+		rd.closeConn(conn)
 		return nil, err
 	}
+	conn.lastUseAt = time.Now()
 
 	rd.connections[domain] = conn
-	return conn.C, nil
+	return conn, nil
 }
 
 func (rd *remoteDelivery) newConn(ctx context.Context, domain string) (*mxConn, error) {
@@ -279,10 +304,11 @@ func (rd *remoteDelivery) newConn(ctx context.Context, domain string) (*mxConn, 
 		reuseLimit: rd.rt.connReuseLimit,
 		C:          smtpconn.New(),
 		domain:     domain,
+		lastUseAt:  time.Now(),
 	}
 
 	conn.Dialer = rd.rt.dialer
-	conn.Log = rd.Log
+	conn.Log = rd.log
 	conn.Hostname = rd.rt.hostname
 	conn.AddrInSMTPMsg = true
 	if rd.rt.connectTimeout != 0 {
@@ -320,7 +346,7 @@ func (rd *remoteDelivery) newConn(ctx context.Context, domain string) (*mxConn, 
 
 		if err := rd.attemptMX(ctx, &conn, record); err != nil {
 			if len(records) != 0 {
-				rd.Log.Error("cannot use MX", err, "remote_server", record.Host, "domain", domain)
+				rd.log.Error("cannot use MX", err, "remote_server", record.Host, "domain", domain)
 			}
 			lastErr = err
 			continue
@@ -329,7 +355,7 @@ func (rd *remoteDelivery) newConn(ctx context.Context, domain string) (*mxConn, 
 	}
 	region.End()
 
-	// Stil not connected? Bail out.
+	// Still not connected? Bail out.
 	if conn.Client() == nil {
 		return nil, &exterrors.SMTPError{
 			Code:         exterrors.SMTPCode(lastErr, 451, 550),

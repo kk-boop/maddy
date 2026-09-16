@@ -15,8 +15,8 @@ daemon with uniform configuration and minimal maintenance cost.
 feature-packed implementation you may want to use Dovecot instead. maddy still
 can handle message delivery business.
 
-[![builds.sr.ht status](https://builds.sr.ht/~emersion/maddy.svg)](https://builds.sr.ht/~emersion/maddy?)
-[![Issues tracker](https://img.shields.io/github/issues/foxcpp/maddy)](https://github.com/foxcpp/maddy)
+[![CI status](https://img.shields.io/github/actions/workflow/status/foxcpp/maddy/cicd.yml?style=flat-square)](https://github.com/foxcpp/maddy/actions/workflows/cicd.yml)
+[![Issues tracker](https://img.shields.io/github/issues/foxcpp/maddy?style=flat-square)](https://github.com/foxcpp/maddy)
 
 * [Setup tutorial](https://maddy.email/tutorials/setting-up/)
 * [Documentation](https://maddy.email/)

@@ -29,7 +29,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 )
@@ -43,9 +42,13 @@ func (m *Modifier) loadOrGenerateKey(keyPath, newKeyAlgo string) (pkey crypto.Si
 		}
 		return nil, false, err
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			m.log.Error("failed to close key file", err)
+		}
+	}()
 
-	pemBlob, err := ioutil.ReadAll(f)
+	pemBlob, err := io.ReadAll(f)
 	if err != nil {
 		return nil, false, err
 	}

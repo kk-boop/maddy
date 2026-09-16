@@ -39,7 +39,9 @@ const (
 	TLSNone TLSLevel = iota
 	TLSEncrypted
 	TLSAuthenticated
+)
 
+const (
 	MXNone MXLevel = iota
 	MX_MTASTS
 	MX_DNSSEC
@@ -94,7 +96,7 @@ type (
 	// Modules implementing this interface should be registered with "mx_auth."
 	// prefix in name.
 	MXAuthPolicy interface {
-		Start(*MsgMetadata) DeliveryMXAuthPolicy
+		StartDelivery(*MsgMetadata) DeliveryMXAuthPolicy
 
 		// Weight is an integer in range 0-1000 that represents relative
 		// ordering of policy application.
@@ -113,11 +115,11 @@ type (
 		// CheckConn call.
 		PrepareDomain(ctx context.Context, domain string)
 
-		// PrepareDomain is called before connection and may asynchronously
+		// PrepareConn is called before connection and may asynchronously
 		// start additional lookups necessary for policy application in
 		// CheckConn.
 		//
-		// If there any errors - they should be deferred to the CheckConn
+		// If there are any errors - they should be deferred to the CheckConn
 		// call.
 		PrepareConn(ctx context.Context, mx string)
 

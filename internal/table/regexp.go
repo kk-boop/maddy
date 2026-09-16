@@ -25,29 +25,29 @@ import (
 	"strings"
 
 	"github.com/foxcpp/maddy/framework/config"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 type Regexp struct {
-	modName    string
-	instName   string
-	inlineArgs []string
+	modName  string
+	instName string
 
-	re          *regexp.Regexp
-	replacement string
+	re           *regexp.Regexp
+	replacements []string
 
 	expandPlaceholders bool
 }
 
-func NewRegexp(modName, instName string, _, inlineArgs []string) (module.Module, error) {
+func NewRegexp(_ *container.C, modName, instName string) (module.Module, error) {
 	return &Regexp{
-		modName:    modName,
-		instName:   instName,
-		inlineArgs: inlineArgs,
+		modName:  modName,
+		instName: instName,
 	}, nil
 }
 
-func (r *Regexp) Init(cfg *config.Map) error {
+func (r *Regexp) Configure(inlineArgs []string, cfg *config.Map) error {
 	var (
 		fullMatch       bool
 		caseInsensitive bool
@@ -59,12 +59,9 @@ func (r *Regexp) Init(cfg *config.Map) error {
 		return err
 	}
 
-	if len(r.inlineArgs) > 2 {
-		return fmt.Errorf("%s: at most two arguments accepted", r.modName)
-	}
-	regex := r.inlineArgs[0]
-	if len(r.inlineArgs) == 2 {
-		r.replacement = r.inlineArgs[1]
+	regex := inlineArgs[0]
+	if len(inlineArgs) > 1 {
+		r.replacements = inlineArgs[1:]
 	}
 
 	if fullMatch {
@@ -96,19 +93,35 @@ func (r *Regexp) InstanceName() string {
 	return r.modName
 }
 
-func (r *Regexp) Lookup(_ context.Context, key string) (string, bool, error) {
+func (r *Regexp) LookupMulti(_ context.Context, key string) ([]string, error) {
 	matches := r.re.FindStringSubmatchIndex(key)
 	if matches == nil {
+		return []string{}, nil
+	}
+
+	result := []string{}
+	for _, replacement := range r.replacements {
+		if !r.expandPlaceholders {
+			result = append(result, replacement)
+		} else {
+			result = append(result, string(r.re.ExpandString([]byte{}, replacement, key, matches)))
+		}
+	}
+	return result, nil
+}
+
+func (r *Regexp) Lookup(ctx context.Context, key string) (string, bool, error) {
+	newVal, err := r.LookupMulti(ctx, key)
+	if err != nil {
+		return "", false, err
+	}
+	if len(newVal) == 0 {
 		return "", false, nil
 	}
 
-	if !r.expandPlaceholders {
-		return r.replacement, true, nil
-	}
-
-	return string(r.re.ExpandString([]byte{}, r.replacement, key, matches)), true, nil
+	return newVal[0], true, nil
 }
 
 func init() {
-	module.Register("table.regexp", NewRegexp)
+	modules.Register("table.regexp", NewRegexp)
 }

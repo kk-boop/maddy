@@ -49,14 +49,14 @@ type checkRunner struct {
 	didDMARCFetch bool
 	dmarcVerify   *dmarc.Verifier
 
-	log log.Logger
+	log *log.Logger
 
 	states map[module.Check]module.CheckState
 
 	mergedRes module.CheckResult
 }
 
-func newCheckRunner(msgMeta *module.MsgMetadata, log log.Logger, r dns.Resolver) *checkRunner {
+func newCheckRunner(msgMeta *module.MsgMetadata, log *log.Logger, r dns.Resolver) *checkRunner {
 	return &checkRunner{
 		msgMeta:              msgMeta,
 		checkedRcptsPerCheck: map[module.CheckState]map[string]struct{}{},
@@ -73,7 +73,9 @@ func (cr *checkRunner) checkStates(ctx context.Context, checks []module.Check) (
 	newStatesMap := make(map[module.Check]module.CheckState, len(checks))
 	closeStates := func() {
 		for _, state := range states {
-			state.Close()
+			if err := state.Close(); err != nil {
+				cr.log.Error("failed to close check state", err)
+			}
 		}
 	}
 
@@ -125,7 +127,6 @@ func (cr *checkRunner) checkStates(ctx context.Context, checks []module.Check) (
 
 	if len(cr.checkedRcpts) != 0 {
 		for _, rcpt := range cr.checkedRcpts {
-			rcpt := rcpt
 			err := cr.runAndMergeResults(states, func(s module.CheckState) module.CheckResult {
 				// Avoid calling CheckRcpt for the same recipient for the same check
 				// multiple times, even if requested.
@@ -176,7 +177,6 @@ func (cr *checkRunner) runAndMergeResults(states []module.CheckState, runner fun
 	}{}
 
 	for _, state := range states {
-		state := state
 		data.wg.Add(1)
 		go func() {
 			defer func() {
@@ -344,8 +344,12 @@ func (cr *checkRunner) applyResults(hostname string, header *textproto.Header) e
 }
 
 func (cr *checkRunner) close() {
-	cr.dmarcVerify.Close()
+	if err := cr.dmarcVerify.Close(); err != nil {
+		cr.log.Error("failed to close dmarc verify state", err)
+	}
 	for _, state := range cr.states {
-		state.Close()
+		if err := state.Close(); err != nil {
+			cr.log.Error("failed to close check state", err)
+		}
 	}
 }

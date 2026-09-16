@@ -28,32 +28,32 @@ package modconfig
 
 import (
 	"fmt"
-	"io"
 	"reflect"
 	"strings"
 
 	parser "github.com/foxcpp/maddy/framework/cfgparser"
 	"github.com/foxcpp/maddy/framework/config"
-	"github.com/foxcpp/maddy/framework/hooks"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 // createInlineModule is a helper function for config matchers that can create inline modules.
-func createInlineModule(preferredNamespace, modName string, args []string) (module.Module, error) {
-	var newMod module.FuncNewModule
+func createInlineModule(c *container.C, preferredNamespace, modName string) (module.Module, error) {
+	var newMod modules.FuncNewModule
 	originalModName := modName
 
 	// First try to extend the name with preferred namespace unless the name
 	// already contains it.
 	if !strings.Contains(modName, ".") && preferredNamespace != "" {
 		modName = preferredNamespace + "." + modName
-		newMod = module.Get(modName)
+		newMod = modules.Get(modName)
 	}
 
 	// Then try global namespace for compatibility and complex modules.
 	if newMod == nil {
-		newMod = module.Get(originalModName)
+		newMod = modules.Get(originalModName)
 	}
 
 	// Bail if both failed.
@@ -61,26 +61,21 @@ func createInlineModule(preferredNamespace, modName string, args []string) (modu
 		return nil, fmt.Errorf("unknown module: %s (namespace: %s)", originalModName, preferredNamespace)
 	}
 
-	return newMod(modName, "", nil, args)
+	return newMod(c, modName, "")
 }
 
-// initInlineModule constructs "faked" config tree and passes it to module
+// configureInlineModule constructs "faked" config tree and passes it to module
 // Init function to make it look like it is defined at top-level.
 //
-// args must contain at least one argument, otherwise initInlineModule panics.
-func initInlineModule(modObj module.Module, globals map[string]interface{}, block config.Node) error {
-	err := modObj.Init(config.NewMap(globals, block))
+// args must contain at least one argument, otherwise configureInlineModule panics.
+func configureInlineModule(modObj module.Module, args []string, globals map[string]interface{}, block config.Node) error {
+	err := modObj.Configure(args, config.NewMap(globals, block))
 	if err != nil {
 		return err
 	}
 
-	if closer, ok := modObj.(io.Closer); ok {
-		hooks.AddHook(hooks.EventShutdown, func() {
-			log.Debugf("close %s (%s)", modObj.Name(), modObj.InstanceName())
-			if err := closer.Close(); err != nil {
-				log.Printf("module %s (%s) close failed: %v", modObj.Name(), modObj.InstanceName(), err)
-			}
-		})
+	if li, ok := modObj.(container.LifetimeModule); ok {
+		container.Global.Lifetime.Add(li)
 	}
 
 	return nil
@@ -117,11 +112,11 @@ func ModuleFromNode(preferredNamespace string, args []string, inlineCfg config.N
 		if len(args) != 1 || inlineCfg.Children != nil {
 			return parser.NodeErr(inlineCfg, "exactly one argument is required to use existing config block")
 		}
-		modObj, err = module.GetInstance(args[0][1:])
+		modObj, err = container.Global.Modules.Get(args[0][1:])
 		log.Debugf("%s:%d: reference %s", inlineCfg.File, inlineCfg.Line, args[0])
 	} else {
 		log.Debugf("%s:%d: new module %s %v", inlineCfg.File, inlineCfg.Line, args[0], args[1:])
-		modObj, err = createInlineModule(preferredNamespace, args[0], args[1:])
+		modObj, err = createInlineModule(container.Global, preferredNamespace, args[0])
 	}
 	if err != nil {
 		return err
@@ -144,7 +139,7 @@ func ModuleFromNode(preferredNamespace string, args []string, inlineCfg config.N
 	reflect.ValueOf(moduleIface).Elem().Set(reflect.ValueOf(modObj))
 
 	if !referenceExisting {
-		if err := initInlineModule(modObj, globals, inlineCfg); err != nil {
+		if err := configureInlineModule(modObj, args[1:], globals, inlineCfg); err != nil {
 			return err
 		}
 	}

@@ -23,7 +23,9 @@ import (
 
 	"github.com/foxcpp/maddy/framework/config"
 	modconfig "github.com/foxcpp/maddy/framework/config/module"
+	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
 
 type Chain struct {
@@ -34,14 +36,14 @@ type Chain struct {
 	optional []bool
 }
 
-func NewChain(modName, instName string, _, _ []string) (module.Module, error) {
+func NewChain(_ *container.C, modName, instName string) (module.Module, error) {
 	return &Chain{
 		modName:  modName,
 		instName: instName,
 	}, nil
 }
 
-func (s *Chain) Init(cfg *config.Map) error {
+func (s *Chain) Configure(inlineArgs []string, cfg *config.Map) error {
 	cfg.Callback("step", func(m *config.Map, node config.Node) error {
 		var tbl module.Table
 		err := modconfig.ModuleFromNode("table", node.Args, node, m.Globals, &tbl)
@@ -78,22 +80,54 @@ func (s *Chain) InstanceName() string {
 }
 
 func (s *Chain) Lookup(ctx context.Context, key string) (string, bool, error) {
-	for i, step := range s.chain {
-		val, ok, err := step.Lookup(ctx, key)
-		if err != nil {
-			return "", false, err
-		}
-		if !ok {
-			if s.optional[i] {
-				continue
-			}
-			return "", false, nil
-		}
-		key = val
+	newVal, err := s.LookupMulti(ctx, key)
+	if err != nil {
+		return "", false, err
 	}
-	return key, true, nil
+	if len(newVal) == 0 {
+		return "", false, nil
+	}
+
+	return newVal[0], true, nil
+}
+
+func (s *Chain) LookupMulti(ctx context.Context, key string) ([]string, error) {
+	result := []string{key}
+STEP:
+	for i, step := range s.chain {
+		newResult := []string{}
+		for _, key = range result {
+			if step_multi, ok := step.(module.MultiTable); ok {
+				val, err := step_multi.LookupMulti(ctx, key)
+				if err != nil {
+					return []string{}, err
+				}
+				if len(val) == 0 {
+					if s.optional[i] {
+						continue STEP
+					}
+					return []string{}, nil
+				}
+				newResult = append(newResult, val...)
+			} else {
+				val, ok, err := step.Lookup(ctx, key)
+				if err != nil {
+					return []string{}, err
+				}
+				if !ok {
+					if s.optional[i] {
+						continue STEP
+					}
+					return []string{}, nil
+				}
+				newResult = append(newResult, val)
+			}
+		}
+		result = newResult
+	}
+	return result, nil
 }
 
 func init() {
-	module.Register("table.chain", NewChain)
+	modules.Register("table.chain", NewChain)
 }

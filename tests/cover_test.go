@@ -1,4 +1,5 @@
-//+build cover_main
+//go:build cover_main
+// +build cover_main
 
 /*
 Maddy Mail Server - Composable all-in-one email server.
@@ -36,15 +37,19 @@ https://github.com/albertito/chasquid/blob/master/coverage_test.go
 */
 
 import (
+	"flag"
+	"io"
 	"os"
 	"testing"
 
-	"github.com/foxcpp/maddy"
+	_ "github.com/foxcpp/maddy"                  // To register run command
+	_ "github.com/foxcpp/maddy/internal/cli/ctl" // To register other CLI commands.
+
+	maddycli "github.com/foxcpp/maddy/internal/cli"
 )
 
 func TestMain(m *testing.M) {
-	// -test.* flags are registered somewhere in init() in "testing" (?)
-	// so calling flag.Parse() in maddy.Run() catches them up.
+	// -test.* flags are registered somewhere in init() in "testing" (?).
 
 	// maddy.Run changes the working directory, we need to change it back so
 	// -test.coverprofile writes out profile in the right location.
@@ -53,18 +58,28 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 
-	code := maddy.Run()
+	// Skip flag parsing and make flag.Parse no-op so when
+	// m.Run calls it it will not error out on maddy flags.
+	args := os.Args
+	os.Args = []string{"command"}
+	flag.Parse()
+	os.Args = args
+
+	code := maddycli.RunWithoutExit()
 
 	if err := os.Chdir(wd); err != nil {
 		panic(err)
 	}
 
 	// Silence output produced by "testing" runtime.
-	_, w, err := os.Pipe()
+	r, w, err := os.Pipe()
 	if err == nil {
 		os.Stderr = w
 		os.Stdout = w
 	}
+	go func() {
+		_, _ = io.ReadAll(r)
+	}()
 
 	// Even though we do not have any tests to run, we need to call out into
 	// "testing" to make it process flags and produce the coverage report.
